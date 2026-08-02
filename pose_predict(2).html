@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Pose + Prediction</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;height:100%;}
+  #wrap{position:relative;width:100vw;height:100vh;}
+  video,canvas#overlay{position:absolute;top:0;left:0;width:100%;height:100%;
+    object-fit:cover;transform:scaleX(-1);}
+  #status{position:absolute;top:8px;left:8px;color:#7CFF9E;font-family:monospace;font-size:12px;
+    background:rgba(0,0,0,.62);padding:6px 9px;border-radius:6px;z-index:10;max-width:88vw;white-space:pre;}
+  #intent{position:absolute;top:74px;left:8px;color:#FFD27C;font-family:monospace;font-size:13px;
+    background:rgba(0,0,0,.62);padding:8px 9px;border-radius:6px;z-index:10;line-height:1.5;white-space:pre;}
+  #bigCall{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9;
+    font-family:'Helvetica Neue',sans-serif;font-size:16vw;font-weight:800;color:rgba(226,98,44,0);
+    transition:color .1s;pointer-events:none;}
+  #controls{position:absolute;bottom:10px;left:8px;right:8px;z-index:15;
+    background:rgba(0,0,0,.62);padding:9px;border-radius:8px;font-family:sans-serif;}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:7px;}
+  .row:last-child{margin-bottom:0;}
+  .row label{color:#ddd;font-size:11px;display:flex;align-items:center;gap:5px;white-space:nowrap;}
+  input[type=range]{flex:1;accent-color:#E2622C;min-width:50px;}
+  button{padding:9px 13px;font-size:12.5px;border:none;border-radius:7px;font-weight:bold;flex-shrink:0;}
+  #sampleBtn{background:#E2622C;color:#1A0D06;}
+  #sampleBtn.armed{background:#FFD27C;color:#111;}
+  button:disabled{opacity:.45;}
+  #swatch{width:26px;height:26px;border-radius:6px;border:2px solid #666;background:#E2622C;flex-shrink:0;}
+  #startBtn{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:20;
+    padding:16px 28px;font-size:18px;background:#E2622C;color:#111;border-radius:10px;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div id="status">Tap to start</div>
+  <div id="intent">waiting…</div>
+  <div id="bigCall"></div>
+
+  <div id="controls">
+    <div class="row">
+      <button id="sampleBtn" disabled>Sample ball</button>
+      <span id="swatch"></span>
+      <label>hue <span id="hueVal">18</span></label>
+      <input type="range" id="hueSlider" min="0" max="360" value="18">
+    </div>
+    <div class="row">
+      <label>tol <span id="tolVal">18</span></label>
+      <input type="range" id="tolSlider" min="4" max="60" value="18">
+      <label>sat <span id="satVal">40</span></label>
+      <input type="range" id="satSlider" min="10" max="100" value="40">
+      <label><input type="checkbox" id="maskToggle"> mask</label>
+    </div>
+    <div class="row">
+      <label>lookahead <span id="laVal">250</span>ms</label>
+      <input type="range" id="laSlider" min="0" max="600" step="25" value="250">
+      <label>commit <span id="cmVal">0.9</span></label>
+      <input type="range" id="cmSlider" min="20" max="180" value="90">
+      <label>torso <span id="twVal">50</span>%</label>
+      <input type="range" id="twSlider" min="0" max="100" value="50">
+    </div>
+  </div>
+
+  <button id="startBtn">Tap to start camera</button>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video   = document.getElementById('video');
+const canvas  = document.getElementById('overlay');
+const ctx     = canvas.getContext('2d');
+const statusEl= document.getElementById('status');
+const intentEl= document.getElementById('intent');
+const bigCall = document.getElementById('bigCall');
+const startBtn= document.getElementById('startBtn');
+const sampleBtn = document.getElementById('sampleBtn');
+const hueSlider = document.getElementById('hueSlider');
+const tolSlider = document.getElementById('tolSlider');
+const satSlider = document.getElementById('satSlider');
+const maskToggle= document.getElementById('maskToggle');
+const swatch    = document.getElementById('swatch');
+const satVal    = document.getElementById('satVal');
+const laSlider  = document.getElementById('laSlider');
+const cmSlider  = document.getElementById('cmSlider');
+const twSlider  = document.getElementById('twSlider');
+const hueVal=document.getElementById('hueVal'), tolVal=document.getElementById('tolVal');
+const laVal=document.getElementById('laVal'),   cmVal=document.getElementById('cmVal');
+const twVal=document.getElementById('twVal');
+
+/* ---------------- Kalman: constant-velocity 2D ----------------
+   state = [x, y, vx, vy].  Predicts through detection dropouts,
+   smooths jitter, and gives us velocity for free (needed to
+   extrapolate forward).                                        */
+class Kalman2D {
+  constructor(procNoise = 900, measNoise = 90){
+    this.x = null;                 // [x,y,vx,vy]
+    this.P = null;
+    this.q = procNoise;            // trust in the motion model
+    this.r = measNoise;            // trust in measurements
+    this.missing = 0;
+  }
+  _identity(){ return [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]; }
+  init(mx, my){
+    this.x = [mx, my, 0, 0];
+    this.P = [[100,0,0,0],[0,100,0,0],[0,0,1000,0],[0,0,0,1000]];
+    this.missing = 0;
+  }
+  predict(dt){
+    if(!this.x) return;
+    const [x,y,vx,vy] = this.x;
+    this.x = [x + vx*dt, y + vy*dt, vx, vy];
+    // P = F P F' + Q  (expanded for this small fixed structure)
+    const P = this.P, q = this.q;
+    const n = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+    n[0][0] = P[0][0] + dt*(P[0][2]+P[2][0]) + dt*dt*P[2][2] + q*dt*dt*dt/3;
+    n[0][2] = P[0][2] + dt*P[2][2] + q*dt*dt/2;
+    n[2][0] = n[0][2];
+    n[2][2] = P[2][2] + q*dt;
+    n[1][1] = P[1][1] + dt*(P[1][3]+P[3][1]) + dt*dt*P[3][3] + q*dt*dt*dt/3;
+    n[1][3] = P[1][3] + dt*P[3][3] + q*dt*dt/2;
+    n[3][1] = n[1][3];
+    n[3][3] = P[3][3] + q*dt;
+    this.P = n;
+    this.missing++;
+  }
+  update(mx, my){
+    if(!this.x){ this.init(mx,my); return; }
+    const r = this.r;
+    // x axis
+    let S = this.P[0][0] + r;
+    let k0 = this.P[0][0]/S, k2 = this.P[2][0]/S;
+    let inn = mx - this.x[0];
+    this.x[0] += k0*inn; this.x[2] += k2*inn;
+    const p00=this.P[0][0], p02=this.P[0][2], p20=this.P[2][0], p22=this.P[2][2];
+    this.P[0][0]=p00-k0*p00; this.P[0][2]=p02-k0*p02;
+    this.P[2][0]=p20-k2*p00; this.P[2][2]=p22-k2*p02;
+    // y axis
+    S = this.P[1][1] + r;
+    let k1 = this.P[1][1]/S, k3 = this.P[3][1]/S;
+    inn = my - this.x[1];
+    this.x[1] += k1*inn; this.x[3] += k3*inn;
+    const p11=this.P[1][1], p13=this.P[1][3], p31=this.P[3][1], p33=this.P[3][3];
+    this.P[1][1]=p11-k1*p11; this.P[1][3]=p13-k1*p13;
+    this.P[3][1]=p31-k3*p11; this.P[3][3]=p33-k3*p13;
+    this.missing = 0;
+  }
+  project(ms){                     // where will it be in `ms` milliseconds
+    if(!this.x) return null;
+    const t = ms/1000;
+    return { x: this.x[0] + this.x[2]*t, y: this.x[1] + this.x[3]*t };
+  }
+  get pos(){ return this.x ? {x:this.x[0], y:this.x[1]} : null; }
+  get vel(){ return this.x ? {x:this.x[2], y:this.x[3]} : null; }
+}
+
+const ballK = new Kalman2D(4000, 60);   // ball moves fast, detection is decent
+const bodyK = new Kalman2D(600, 120);   // body is slower, pose is smoother
+
+/* ---------------- colour-blob ball detection ---------------- */
+const PROC_W=160, PROC_H=120;
+const proc = document.createElement('canvas');
+proc.width=PROC_W; proc.height=PROC_H;
+const pctx = proc.getContext('2d', {willReadFrequently:true});
+let targetHue=18, hueTol=18, minSat=40;
+const MIN_VAL=25, MIN_BLOB_PX=12;
+
+hueSlider.oninput=()=>{targetHue=+hueSlider.value; hueVal.textContent=targetHue;};
+tolSlider.oninput=()=>{hueTol=+tolSlider.value;   tolVal.textContent=hueTol;};
+satSlider.oninput=()=>{minSat=+satSlider.value;   satVal.textContent=minSat;};
+laSlider.oninput =()=>{laVal.textContent=laSlider.value;};
+cmSlider.oninput =()=>{cmVal.textContent=(cmSlider.value/100).toFixed(2);};
+twSlider.oninput =()=>{twVal.textContent=twSlider.value;};
+
+function rgbToHsv(r,g,b){
+  r/=255;g/=255;b/=255;
+  const max=Math.max(r,g,b),min=Math.min(r,g,b),d=max-min;
+  let h=0;
+  if(d!==0){
+    if(max===r) h=60*(((g-b)/d)%6);
+    else if(max===g) h=60*((b-r)/d+2);
+    else h=60*((r-g)/d+4);
+  }
+  if(h<0)h+=360;
+  return {h, s: max===0?0:(d/max)*100, v:max*100};
+}
+const hueDist=(a,b)=>{const d=Math.abs(a-b)%360; return d>180?360-d:d;};
+
+function findBall(){
+  pctx.drawImage(video,0,0,PROC_W,PROC_H);
+  const px = pctx.getImageData(0,0,PROC_W,PROC_H).data;
+  const mask = new Uint8Array(PROC_W*PROC_H);
+  for(let i=0,p=0;i<px.length;i+=4,p++){
+    const {h,s,v}=rgbToHsv(px[i],px[i+1],px[i+2]);
+    if(v>=MIN_VAL && s>=minSat && hueDist(h,targetHue)<=hueTol) mask[p]=1;
+  }
+  const seen=new Uint8Array(PROC_W*PROC_H); let best=null; const st=[];
+  for(let s0=0;s0<mask.length;s0++){
+    if(!mask[s0]||seen[s0]) continue;
+    st.length=0; st.push(s0); seen[s0]=1;
+    let c=0,sx=0,sy=0,mnX=PROC_W,mxX=0,mnY=PROC_H,mxY=0;
+    while(st.length){
+      const p=st.pop(), x=p%PROC_W, y=(p/PROC_W)|0;
+      c++; sx+=x; sy+=y;
+      if(x<mnX)mnX=x; if(x>mxX)mxX=x; if(y<mnY)mnY=y; if(y>mxY)mxY=y;
+      if(x>0&&mask[p-1]&&!seen[p-1]){seen[p-1]=1;st.push(p-1);}
+      if(x<PROC_W-1&&mask[p+1]&&!seen[p+1]){seen[p+1]=1;st.push(p+1);}
+      if(y>0&&mask[p-PROC_W]&&!seen[p-PROC_W]){seen[p-PROC_W]=1;st.push(p-PROC_W);}
+      if(y<PROC_H-1&&mask[p+PROC_W]&&!seen[p+PROC_W]){seen[p+PROC_W]=1;st.push(p+PROC_W);}
+    }
+    if(c<MIN_BLOB_PX) continue;
+    const bw=mxX-mnX+1, bh=mxY-mnY+1;
+    const round = (bw/bh)>0.55 && (bw/bh)<1.8 && (c/(bw*bh))>0.45;
+    const cand={c,cx:sx/c,cy:sy/c,bw,bh,round};
+    if(!best) best=cand;
+    else if(cand.round&&!best.round) best=cand;
+    else if(cand.round===best.round&&cand.c>best.c) best=cand;
+  }
+  return {best, mask: maskToggle.checked ? mask : null};
+}
+
+/* ---------------- ball colour sampling ----------------
+   Tapping a small moving ball on a phone is fiddly, so the primary
+   method is: hold the ball inside the on-screen target circle and let
+   it sample automatically after a countdown. Tapping still works as a
+   fallback (pointerdown, not click — iOS Safari is unreliable with
+   click on non-interactive elements).                              */
+let sampleArmed=false, sampleCountdown=0, sampleTimer=null;
+const TARGET_R_FRAC = 0.13;   // target circle radius, fraction of the short side
+
+function medianOf(arr){
+  if(!arr.length) return null;
+  arr.sort((a,b)=>a-b);
+  return arr[Math.floor(arr.length/2)];
+}
+
+// sample every reasonably-colourful pixel inside a circle, take the MEDIAN hue.
+// median ignores shadow and glare outliers that would skew a plain average.
+function sampleRegion(cxP, cyP, rP){
+  pctx.drawImage(video,0,0,PROC_W,PROC_H);
+  const d = pctx.getImageData(0,0,PROC_W,PROC_H).data;
+  const hues=[], sats=[];
+  for(let y=Math.max(0,cyP-rP); y<Math.min(PROC_H,cyP+rP); y++){
+    for(let x=Math.max(0,cxP-rP); x<Math.min(PROC_W,cxP+rP); x++){
+      if((x-cxP)**2 + (y-cyP)**2 > rP*rP) continue;
+      const i=(y*PROC_W+x)*4;
+      const {h,s,v}=rgbToHsv(d[i],d[i+1],d[i+2]);
+      if(s<25 || v<30 || v>97) continue;     // skip greys, shadows, blown-out glare
+      hues.push(h); sats.push(s);
+    }
+  }
+  if(hues.length < 20) return false;
+
+  targetHue = Math.round(medianOf(hues));
+  const medSat = medianOf(sats);
+  minSat = Math.max(15, Math.round(medSat*0.55));
+
+  hueSlider.value=targetHue; hueVal.textContent=targetHue;
+  satSlider.value=minSat;    satVal.textContent=minSat;
+  swatch.style.background = `hsl(${targetHue} 85% 50%)`;
+  return true;
+}
+
+function armSample(){
+  if(sampleArmed) { cancelSample(); return; }
+  sampleArmed=true;
+  sampleCountdown=3;
+  sampleBtn.classList.add('armed');
+  clearInterval(sampleTimer);
+  sampleTimer=setInterval(()=>{
+    sampleCountdown--;
+    if(sampleCountdown<=0){
+      clearInterval(sampleTimer);
+      const ok = sampleRegion(PROC_W/2|0, PROC_H/2|0, Math.round(Math.min(PROC_W,PROC_H)*TARGET_R_FRAC));
+      sampleBtn.textContent = ok ? 'Sampled ✓' : 'No colour found';
+      setTimeout(()=>{ sampleBtn.textContent='Sample ball'; }, 1400);
+      sampleArmed=false; sampleBtn.classList.remove('armed');
+    }
+  },1000);
+}
+function cancelSample(){
+  clearInterval(sampleTimer);
+  sampleArmed=false;
+  sampleBtn.classList.remove('armed');
+  sampleBtn.textContent='Sample ball';
+}
+sampleBtn.onclick=armSample;
+
+// fallback: tap anywhere on the video to sample that spot
+document.getElementById('wrap').addEventListener('pointerdown',(e)=>{
+  if(e.target.closest('#controls')||e.target.id==='startBtn') return;
+  if(!video.videoWidth) return;
+  const rect=video.getBoundingClientRect(), vw=video.videoWidth, vh=video.videoHeight;
+  const sc=Math.max(rect.width/vw, rect.height/vh);
+  const oX=(rect.width-vw*sc)/2, oY=(rect.height-vh*sc)/2;
+  let vx=(e.clientX-rect.left-oX)/sc; const vy=(e.clientY-rect.top-oY)/sc;
+  vx=vw-vx;                                    // undo CSS mirror
+  const sx=Math.round(vx*PROC_W/vw), sy=Math.round(vy*PROC_H/vh);
+  if(sx<0||sy<0||sx>=PROC_W||sy>=PROC_H) return;
+  if(sampleRegion(sx, sy, 6)){
+    cancelSample();
+    sampleBtn.textContent='Sampled ✓';
+    setTimeout(()=>{ sampleBtn.textContent='Sample ball'; },1400);
+  }
+});
+
+/* ---------------- pose ---------------- */
+let poseLandmarker=null;
+const L = {LSH:11,RSH:12,LHIP:23,RHIP:24,LKNEE:25,RKNEE:26,LANK:27,RANK:28};
+const BONES=[[11,12],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28],[11,13],[13,15],[12,14],[14,16]];
+
+async function setup(){
+  statusEl.textContent='Loading pose model…';
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  poseLandmarker = await PoseLandmarker.createFromOptions(vision,{
+    baseOptions:{
+      modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate:"GPU"
+    },
+    runningMode:"VIDEO", numPoses:1
+  });
+
+  statusEl.textContent='Requesting camera…';
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video:{facingMode:'user',width:{ideal:1280},height:{ideal:720}},audio:false});
+  video.srcObject=stream;
+  await new Promise(r=>{video.onloadedmetadata=r;});
+  await video.play();
+  canvas.width=video.videoWidth; canvas.height=video.videoHeight;
+  sampleBtn.disabled=false;
+  requestAnimationFrame(loop);
+}
+
+let lastT = performance.now();
+
+function loop(){
+  const now = performance.now();
+  const dt  = Math.min(0.1, (now-lastT)/1000);
+  const fps = Math.round(1/Math.max(0.001,(now-lastT)/1000));
+  lastT = now;
+
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const W=canvas.width, H=canvas.height;
+
+  // --- ball: detect, then Kalman ---
+  const {best: blob, mask: dbgMask} = findBall();
+  if(dbgMask){
+    const mx=W/PROC_W, my=H/PROC_H;
+    ctx.fillStyle='rgba(226,98,44,0.42)';
+    for(let p=0;p<dbgMask.length;p++)
+      if(dbgMask[p]) ctx.fillRect((p%PROC_W)*mx, ((p/PROC_W)|0)*my, mx, my);
+  }
+
+  ballK.predict(dt);
+  if(blob) ballK.update(blob.cx*W/PROC_W, blob.cy*H/PROC_H);
+
+  // --- pose ---
+  let lm=null;
+  if(poseLandmarker){
+    const res = poseLandmarker.detectForVideo(video, now);
+    if(res.landmarks && res.landmarks.length) lm = res.landmarks[0];
+  }
+
+  bodyK.predict(dt);
+  let lean=0, committed=false, comX=null, baseC=null, baseHalf=null;
+  let torsoTilt=0, rotation=0, fused=0;
+  if(lm){
+    const hipX=(lm[L.LHIP].x+lm[L.RHIP].x)/2*W;
+    const hipY=(lm[L.LHIP].y+lm[L.RHIP].y)/2*H;
+    bodyK.update(hipX,hipY);
+
+    // skeleton
+    ctx.strokeStyle='#4FA377'; ctx.lineWidth=4;
+    ctx.beginPath();
+    for(const [a,b] of BONES){
+      if(!lm[a]||!lm[b]) continue;
+      ctx.moveTo(lm[a].x*W, lm[a].y*H);
+      ctx.lineTo(lm[b].x*W, lm[b].y*H);
+    }
+    ctx.stroke();
+    ctx.fillStyle='#7CFF9E';
+    for(const p of lm){ ctx.beginPath(); ctx.arc(p.x*W,p.y*H,4,0,6.283); ctx.fill(); }
+
+    // --- centre of mass vs base of support ---
+    comX = hipX;
+    const la=lm[L.LANK].x*W, ra=lm[L.RANK].x*W;
+    baseC=(la+ra)/2; baseHalf=Math.max(20,Math.abs(la-ra)/2);
+    lean=(comX-baseC)/baseHalf;                 // -1..1 inside the feet, beyond = committed
+
+    /* ---- torso signals ----
+       1) TILT: trunk leaning sideways. The upper body commits before the
+          feet do, so this often leads the COM signal by a beat.
+       2) ROTATION: MediaPipe gives a z (depth) per landmark, so the
+          left/right shoulder depth difference tells us which way the
+          chest is turning — a cut is usually preceded by the torso
+          opening toward the direction of travel.                        */
+    const shMidX=(lm[L.LSH].x+lm[L.RSH].x)/2*W;
+    const shMidY=(lm[L.LSH].y+lm[L.RSH].y)/2*H;
+    const trunkH = Math.max(30, hipY - shMidY);
+    torsoTilt = Math.max(-1.5, Math.min(1.5, (shMidX - hipX)/trunkH / 0.35));
+
+    const shW = Math.abs(lm[L.LSH].x - lm[L.RSH].x) || 0.001;
+    const hipW= Math.abs(lm[L.LHIP].x - lm[L.RHIP].x) || 0.001;
+    const shRot  = (lm[L.LSH].z  - lm[L.RSH].z ) / shW;
+    const hipRot = (lm[L.LHIP].z - lm[L.RHIP].z) / hipW;
+    rotation = Math.max(-1.5, Math.min(1.5, (shRot*0.65 + (shRot-hipRot)*0.35)));
+
+    // blend: 0% torso = pure centre-of-mass, 100% = torso-dominant
+    const tw = twSlider.value/100;
+    fused = lean*(1-tw) + (torsoTilt*0.7 + rotation*0.3)*tw;
+    committed = Math.abs(fused) > (cmSlider.value/100);
+
+    // draw base of support + COM
+    const ankY=(lm[L.LANK].y+lm[L.RANK].y)/2*H;
+    ctx.strokeStyle='#8A93A3'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(la,ankY); ctx.lineTo(ra,ankY); ctx.stroke();
+    ctx.strokeStyle = committed ? '#E2622C' : '#FFD27C'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(comX,hipY); ctx.lineTo(comX,ankY); ctx.stroke();
+
+    // trunk axis (hips -> shoulders): shows the lean that precedes the step
+    ctx.strokeStyle = committed ? '#E2622C' : '#9BC7FF'; ctx.lineWidth=5;
+    ctx.beginPath(); ctx.moveTo(hipX,hipY); ctx.lineTo(shMidX,shMidY); ctx.stroke();
+    // vertical reference from the hips, for comparison
+    ctx.setLineDash([5,7]); ctx.strokeStyle='rgba(155,199,255,.5)'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(hipX,hipY); ctx.lineTo(hipX,shMidY); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // --- predicted (extrapolated) positions ---
+  const la_ms = +laSlider.value;
+  const bodyFuture = bodyK.project(la_ms);
+  const ballFuture = ballK.project(la_ms);
+
+  if(ballK.pos && ballK.missing < 12){
+    ctx.strokeStyle='#E2622C'; ctx.lineWidth=4;
+    ctx.beginPath(); ctx.arc(ballK.pos.x, ballK.pos.y, 26,0,6.283); ctx.stroke();
+    if(ballFuture){
+      ctx.setLineDash([8,8]); ctx.strokeStyle='rgba(226,98,44,.85)';
+      ctx.beginPath(); ctx.arc(ballFuture.x, ballFuture.y, 26,0,6.283); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(ballK.pos.x,ballK.pos.y); ctx.lineTo(ballFuture.x,ballFuture.y); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+  if(bodyFuture && lm){
+    ctx.setLineDash([6,6]); ctx.strokeStyle='rgba(124,255,158,.8)'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.arc(bodyFuture.x, bodyFuture.y, 20,0,6.283); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // --- sampling target circle ---
+  if(sampleArmed){
+    const r = Math.min(W,H)*TARGET_R_FRAC;
+    ctx.setLineDash([12,10]); ctx.lineWidth=6; ctx.strokeStyle='#FFD27C';
+    ctx.beginPath(); ctx.arc(W/2,H/2,r,0,6.283); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.save(); ctx.scale(-1,1);              // un-mirror so text reads correctly
+    ctx.fillStyle='#FFD27C'; ctx.font='bold 90px sans-serif'; ctx.textAlign='center';
+    ctx.fillText(sampleCountdown, -W/2, H/2 + r + 100);
+    ctx.font='bold 30px sans-serif';
+    ctx.fillText('hold ball in circle', -W/2, H/2 - r - 30);
+    ctx.restore();
+  }
+
+  // --- intent call ---
+  // display is mirrored, so flip sign to match what you see on screen
+  const screenLean  = -lean;
+  const screenTilt  = -torsoTilt;
+  const screenRot   = -rotation;
+  const screenFused = -fused;
+  const bv = bodyK.vel;
+  let call = '—';
+  if(lm && committed) call = screenFused > 0 ? 'RIGHT' : 'LEFT';
+  bigCall.textContent = call === '—' ? '' : call;
+  bigCall.style.color = call === '—' ? 'rgba(226,98,44,0)' : 'rgba(226,98,44,.75)';
+
+  const bar = (v)=>{
+    const n=Math.max(-1,Math.min(1,v)), slot=Math.round((n+1)*10);
+    return '['+'·'.repeat(slot)+'●'+'·'.repeat(20-slot)+']';
+  };
+
+  intentEl.textContent =
+    `com   ${bar(screenLean)} ${screenLean>=0?'+':''}${screenLean.toFixed(2)}\n` +
+    `tilt  ${bar(screenTilt)} ${screenTilt>=0?'+':''}${screenTilt.toFixed(2)}\n` +
+    `rot   ${bar(screenRot)} ${screenRot>=0?'+':''}${screenRot.toFixed(2)}\n` +
+    `FUSED ${bar(screenFused)} ${screenFused>=0?'+':''}${screenFused.toFixed(2)}\n` +
+    `call  ${call}${committed?'  (committed)':''}\n` +
+    (bv ? `body v  ${Math.round(-bv.x)},${Math.round(bv.y)} px/s` : 'body v  —');
+
+  statusEl.textContent =
+    `${fps}fps  pose:${lm?'yes':'no'}  ball:${blob?'yes':(ballK.missing<12?'predicted':'no')}\n` +
+    `lookahead ${la_ms}ms   ball miss ${ballK.missing}`;
+
+  requestAnimationFrame(loop);
+}
+
+startBtn.onclick=()=>{
+  startBtn.style.display='none';
+  setup().catch(e=>{statusEl.textContent='Error: '+e.message; console.error(e);});
+};
+</script>
+</body>
+</html>
