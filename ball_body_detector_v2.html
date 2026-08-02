@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Ball &amp; Body Detector</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;height:100%;}
+  #wrap{position:relative;width:100vw;height:100vh;}
+  video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);}
+  canvas#overlay{position:absolute;top:0;left:0;width:100%;height:100%;transform:scaleX(-1);}
+  #status{position:absolute;top:8px;left:8px;color:#7CFF9E;font-family:monospace;font-size:12px;
+    background:rgba(0,0,0,.6);padding:6px 9px;border-radius:6px;z-index:10;max-width:88vw;white-space:pre;}
+  #refPanel{position:absolute;top:66px;left:8px;color:#FFD27C;font-family:monospace;font-size:13px;
+    background:rgba(0,0,0,.6);padding:8px 9px;border-radius:6px;z-index:10;max-width:88vw;
+    line-height:1.5;white-space:pre;}
+  #controls{position:absolute;bottom:10px;left:8px;right:8px;z-index:15;
+    background:rgba(0,0,0,.6);padding:9px;border-radius:8px;font-family:sans-serif;}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:7px;}
+  .row:last-child{margin-bottom:0;}
+  .row label{color:#ddd;font-size:11px;display:flex;align-items:center;gap:5px;white-space:nowrap;}
+  input[type=number]{width:46px;padding:5px;border-radius:5px;border:1px solid #444;background:#111;color:#fff;font-size:12px;}
+  input[type=range]{flex:1;accent-color:#E2622C;min-width:60px;}
+  button{padding:9px 14px;font-size:13px;border:none;border-radius:7px;font-weight:bold;
+    font-family:sans-serif;flex-shrink:0;}
+  #resetBtn{background:#4FA377;color:#0A1F14;}
+  #sampleBtn{background:#E2622C;color:#1A0D06;}
+  #sampleBtn.armed{background:#FFD27C;color:#111;}
+  button:disabled{opacity:.45;}
+  #startBtn{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:20;
+    padding:16px 28px;font-size:18px;background:#E2622C;color:#111;border-radius:10px;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div id="status">Tap the button to start</div>
+  <div id="refPanel">Press Reset to set a reference position</div>
+
+  <div id="controls">
+    <div class="row">
+      <button id="sampleBtn" disabled>Tap ball to sample</button>
+      <label>hue <span id="hueVal">18</span></label>
+      <input type="range" id="hueSlider" min="0" max="360" value="18">
+    </div>
+    <div class="row">
+      <label>tol <span id="tolVal">18</span></label>
+      <input type="range" id="tolSlider" min="4" max="60" value="18">
+      <label>sat <span id="satVal">40</span></label>
+      <input type="range" id="satSlider" min="10" max="100" value="40">
+    </div>
+    <div class="row">
+      <label>Delay <input type="number" id="delayInput" value="3" min="0" step="1"> s</label>
+      <button id="resetBtn" disabled>Reset</button>
+      <label><input type="checkbox" id="maskToggle"> show mask</label>
+    </div>
+  </div>
+
+  <button id="startBtn">Tap to start camera</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const video    = document.getElementById('video');
+const canvas   = document.getElementById('overlay');
+const ctx      = canvas.getContext('2d');
+const status   = document.getElementById('status');
+const refPanel = document.getElementById('refPanel');
+const startBtn = document.getElementById('startBtn');
+const resetBtn = document.getElementById('resetBtn');
+const sampleBtn= document.getElementById('sampleBtn');
+const delayInput = document.getElementById('delayInput');
+const hueSlider = document.getElementById('hueSlider');
+const tolSlider = document.getElementById('tolSlider');
+const satSlider = document.getElementById('satSlider');
+const hueVal = document.getElementById('hueVal');
+const tolVal = document.getElementById('tolVal');
+const satVal = document.getElementById('satVal');
+const maskToggle = document.getElementById('maskToggle');
+
+// offscreen canvas for pixel processing (small = fast)
+const PROC_W = 160, PROC_H = 120;
+const proc = document.createElement('canvas');
+proc.width = PROC_W; proc.height = PROC_H;
+const pctx = proc.getContext('2d', { willReadFrequently: true });
+
+let model = null;
+let lastTime = performance.now();
+let sampleArmed = false;
+
+let targetHue = 18, hueTol = 18, minSat = 40;
+const MIN_VAL = 25;      // ignore very dark pixels
+const MIN_BLOB_PX = 12;  // ignore tiny specks
+
+hueSlider.oninput = () => { targetHue = +hueSlider.value; hueVal.textContent = targetHue; };
+tolSlider.oninput = () => { hueTol   = +tolSlider.value; tolVal.textContent = hueTol; };
+satSlider.oninput = () => { minSat   = +satSlider.value; satVal.textContent = minSat; };
+
+function rgbToHsv(r, g, b){
+  r/=255; g/=255; b/=255;
+  const max = Math.max(r,g,b), min = Math.min(r,g,b), d = max-min;
+  let h = 0;
+  if(d !== 0){
+    if(max === r) h = 60 * (((g-b)/d) % 6);
+    else if(max === g) h = 60 * ((b-r)/d + 2);
+    else h = 60 * ((r-g)/d + 4);
+  }
+  if(h < 0) h += 360;
+  return { h, s: max === 0 ? 0 : (d/max)*100, v: max*100 };
+}
+
+function hueDist(a, b){
+  const d = Math.abs(a-b) % 360;
+  return d > 180 ? 360-d : d;
+}
+
+// find the largest connected blob of matching pixels
+function findBall(){
+  pctx.drawImage(video, 0, 0, PROC_W, PROC_H);
+  const img = pctx.getImageData(0, 0, PROC_W, PROC_H);
+  const px = img.data;
+  const mask = new Uint8Array(PROC_W*PROC_H);
+
+  for(let i = 0, p = 0; i < px.length; i += 4, p++){
+    const {h, s, v} = rgbToHsv(px[i], px[i+1], px[i+2]);
+    if(v >= MIN_VAL && s >= minSat && hueDist(h, targetHue) <= hueTol) mask[p] = 1;
+  }
+
+  // connected components via flood fill
+  const seen = new Uint8Array(PROC_W*PROC_H);
+  let best = null;
+  const stack = [];
+
+  for(let start = 0; start < mask.length; start++){
+    if(!mask[start] || seen[start]) continue;
+    stack.length = 0; stack.push(start); seen[start] = 1;
+    let count = 0, sumX = 0, sumY = 0;
+    let minX = PROC_W, maxX = 0, minY = PROC_H, maxY = 0;
+
+    while(stack.length){
+      const p = stack.pop();
+      const x = p % PROC_W, y = (p / PROC_W) | 0;
+      count++; sumX += x; sumY += y;
+      if(x < minX) minX = x; if(x > maxX) maxX = x;
+      if(y < minY) minY = y; if(y > maxY) maxY = y;
+
+      if(x > 0        && mask[p-1]      && !seen[p-1])      { seen[p-1] = 1;      stack.push(p-1); }
+      if(x < PROC_W-1 && mask[p+1]      && !seen[p+1])      { seen[p+1] = 1;      stack.push(p+1); }
+      if(y > 0        && mask[p-PROC_W] && !seen[p-PROC_W]) { seen[p-PROC_W] = 1; stack.push(p-PROC_W); }
+      if(y < PROC_H-1 && mask[p+PROC_W] && !seen[p+PROC_W]) { seen[p+PROC_W] = 1; stack.push(p+PROC_W); }
+    }
+
+    if(count >= MIN_BLOB_PX && (!best || count > best.count)){
+      best = { count, cx: sumX/count, cy: sumY/count, minX, maxX, minY, maxY };
+    }
+  }
+
+  return { blob: best, mask: maskToggle.checked ? mask : null };
+}
+
+// ---- reference tracking ----
+let lastBody = null, lastBall = null;
+let refBody = null, refBall = null;
+let referenceSet = false, countdownActive = false, countdownTimer = null;
+
+function armReference(){
+  clearInterval(countdownTimer);
+  referenceSet = false; refBody = null; refBall = null;
+  let remaining = Math.max(0, Math.round(parseFloat(delayInput.value) || 0));
+  if(remaining <= 0){ captureReference(); return; }
+
+  countdownActive = true;
+  refPanel.textContent = `Setting reference in ${remaining}…`;
+  countdownTimer = setInterval(() => {
+    remaining--;
+    if(remaining <= 0){
+      clearInterval(countdownTimer);
+      countdownActive = false;
+      captureReference();
+    } else {
+      refPanel.textContent = `Setting reference in ${remaining}…`;
+    }
+  }, 1000);
+}
+
+function captureReference(){
+  refBody = lastBody; refBall = lastBall; referenceSet = true;
+  if(!refBody && !refBall){
+    refPanel.textContent = 'Reference set — nothing visible. Get in frame and Reset again.';
+  }
+}
+resetBtn.addEventListener('click', armReference);
+
+// ---- tap to sample ball colour ----
+sampleBtn.addEventListener('click', () => {
+  sampleArmed = !sampleArmed;
+  sampleBtn.classList.toggle('armed', sampleArmed);
+  sampleBtn.textContent = sampleArmed ? 'Now tap the ball' : 'Tap ball to sample';
+});
+
+video.parentElement.addEventListener('click', (e) => {
+  if(!sampleArmed || e.target.closest('#controls') || e.target.id === 'startBtn') return;
+
+  const rect = video.getBoundingClientRect();
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const scale = Math.max(rect.width/vw, rect.height/vh); // object-fit: cover
+  const offX = (rect.width  - vw*scale)/2;
+  const offY = (rect.height - vh*scale)/2;
+
+  let vx = (e.clientX - rect.left - offX)/scale;
+  const vy = (e.clientY - rect.top  - offY)/scale;
+  vx = vw - vx; // undo the CSS mirror
+
+  const sx = Math.round(vx * PROC_W/vw), sy = Math.round(vy * PROC_H/vh);
+  if(sx < 0 || sy < 0 || sx >= PROC_W || sy >= PROC_H) return;
+
+  pctx.drawImage(video, 0, 0, PROC_W, PROC_H);
+  // average a small patch so one noisy pixel doesn't decide it
+  const patch = pctx.getImageData(Math.max(0,sx-2), Math.max(0,sy-2), 5, 5).data;
+  let r=0,g=0,b=0,n=0;
+  for(let i=0;i<patch.length;i+=4){ r+=patch[i]; g+=patch[i+1]; b+=patch[i+2]; n++; }
+  const hsv = rgbToHsv(r/n, g/n, b/n);
+
+  targetHue = Math.round(hsv.h);
+  hueSlider.value = targetHue; hueVal.textContent = targetHue;
+  minSat = Math.max(15, Math.round(hsv.s * 0.5));
+  satSlider.value = minSat; satVal.textContent = minSat;
+
+  sampleArmed = false;
+  sampleBtn.classList.remove('armed');
+  sampleBtn.textContent = 'Tap ball to sample';
+});
+
+async function setup(){
+  status.textContent = 'Loading person model…';
+  model = await cocoSsd.load(); // lite model — person detection is reliable and fast
+
+  status.textContent = 'Requesting camera…';
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: {ideal:1280}, height: {ideal:720} }, audio: false
+  });
+  video.srcObject = stream;
+  await new Promise(res => { video.onloadedmetadata = res; });
+  await video.play();
+
+  resizeCanvas();
+  window.addEventListener('resize', resizeCanvas);
+  resetBtn.disabled = false;
+  sampleBtn.disabled = false;
+  detectLoop();
+}
+
+function resizeCanvas(){
+  canvas.width  = video.videoWidth  || window.innerWidth;
+  canvas.height = video.videoHeight || window.innerHeight;
+}
+
+async function detectLoop(){
+  const now = performance.now();
+  const fps = Math.round(1000/Math.max(1, now-lastTime));
+  lastTime = now;
+
+  const people = await model.detect(video, 5, 0.4);
+  const { blob, mask } = findBall();
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const sx = canvas.width/PROC_W, sy = canvas.height/PROC_H;
+
+  if(mask){
+    ctx.fillStyle = 'rgba(226,98,44,0.45)';
+    for(let p = 0; p < mask.length; p++){
+      if(mask[p]) ctx.fillRect((p%PROC_W)*sx, ((p/PROC_W)|0)*sy, sx, sy);
+    }
+  }
+
+  const person = people.filter(p => p.class === 'person').sort((a,b)=>b.score-a.score)[0];
+  if(person){
+    const [x,y,w,h] = person.bbox;
+    ctx.strokeStyle = '#4FA377'; ctx.lineWidth = 3;
+    ctx.strokeRect(x,y,w,h);
+    lastBody = { x: x+w/2, y: y+h/2, w, h };
+  } else lastBody = null;
+
+  if(blob){
+    const bx = blob.minX*sx, by = blob.minY*sy;
+    const bw = (blob.maxX-blob.minX+1)*sx, bh = (blob.maxY-blob.minY+1)*sy;
+    ctx.strokeStyle = '#E2622C'; ctx.lineWidth = 3;
+    ctx.strokeRect(bx, by, bw, bh);
+    lastBall = { x: blob.cx*sx, y: blob.cy*sy, w: bw, h: bh, px: blob.count };
+  } else lastBall = null;
+
+  const ballInfo = lastBall
+    ? `ball w=${Math.round(lastBall.w)}px (${lastBall.px}px matched)`
+    : `ball: not seen (hue ${targetHue}±${hueTol}, sat>${minSat})`;
+  status.textContent = `${fps}fps  person:${person?'yes':'no'}\n${ballInfo}`;
+
+  if(referenceSet && !countdownActive){
+    const f = v => (v>=0?'+':'') + Math.round(v);
+    let bodyLine = refBody ? (lastBody
+        ? `Body:  x ${f(refBody.x-lastBody.x)}px   y ${f(refBody.y-lastBody.y)}px`
+        : 'Body:  not currently visible')
+      : 'Body:  no reference';
+    let ballLine = refBall ? (lastBall
+        ? `Ball:  lateral ${f(refBall.x-lastBall.x)}px   y ${f(refBall.y-lastBall.y)}px`
+        : 'Ball:  not currently visible')
+      : 'Ball:  no reference';
+    refPanel.textContent = `Reference set\n${bodyLine}\n${ballLine}`;
+  }
+
+  requestAnimationFrame(detectLoop);
+}
+
+startBtn.addEventListener('click', () => {
+  startBtn.style.display = 'none';
+  setup().catch(err => { status.textContent = 'Error: ' + err.message; console.error(err); });
+});
+</script>
+</body>
+</html>
