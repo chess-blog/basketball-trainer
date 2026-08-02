@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+<title>Ball Tracker Lite</title>
+<style>
+  :root{--orange:#E2622C;--dim:#8A93A3;--chalk:#F2EDE4;}
+  html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden;
+    font-family:-apple-system,sans-serif;color:var(--chalk);}
+  #wrap{position:relative;width:100vw;height:100vh;}
+  video,canvas#ov{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+  video.mirror,canvas#ov.mirror{transform:scaleX(-1);}
+  body.blind video{display:none;}
+  body.blind #wrap{background:#000;}
+
+  #hud{position:absolute;top:10px;left:10px;z-index:10;font-family:ui-monospace,monospace;
+    font-size:12px;background:rgba(0,0,0,.6);padding:7px 10px;border-radius:7px;
+    white-space:pre;color:#7CFF9E;}
+  #big{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9;
+    font-family:ui-monospace,monospace;font-size:9vw;font-weight:700;color:var(--orange);
+    text-align:center;line-height:1.25;pointer-events:none;display:none;}
+  body.blind #big{display:block;}
+
+  #panel{position:absolute;bottom:10px;left:10px;right:10px;z-index:15;
+    background:rgba(0,0,0,.68);padding:10px;border-radius:10px;}
+  .r{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;}
+  .r:last-child{margin-bottom:0;}
+  label{font-size:11px;color:#ccc;display:flex;align-items:center;gap:5px;white-space:nowrap;}
+  input[type=range]{flex:1;min-width:54px;accent-color:var(--orange);}
+  select{background:#111;color:#fff;border:1px solid #444;border-radius:6px;padding:5px;font-size:12px;}
+  button{padding:9px 13px;border:0;border-radius:7px;font-weight:700;font-size:12.5px;
+    background:#2A3140;color:var(--chalk);}
+  button.pri{background:var(--orange);color:#1A0D06;}
+  button.on{background:#FFD27C;color:#111;}
+  #sw{width:26px;height:26px;border-radius:6px;border:2px solid #666;background:var(--orange);flex-shrink:0;}
+  #start{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:20;
+    padding:16px 26px;font-size:18px;background:var(--orange);color:#111;border-radius:10px;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" autoplay playsinline muted></video>
+  <canvas id="ov"></canvas>
+  <div id="hud">tap start</div>
+  <div id="big">—</div>
+
+  <div id="panel">
+    <div class="r">
+      <button id="sample" class="pri" disabled>Sample ball</button>
+      <span id="sw"></span>
+      <label>hue <span id="hv">18</span></label>
+      <input type="range" id="hue" min="0" max="360" value="18">
+    </div>
+    <div class="r">
+      <label>tol <span id="tv">20</span></label>
+      <input type="range" id="tol" min="4" max="60" value="20">
+      <label>sat <span id="sv">45</span></label>
+      <input type="range" id="sat" min="10" max="100" value="45">
+    </div>
+    <div class="r">
+      <label>res
+        <select id="res">
+          <option value="60">60×45 (min)</option>
+          <option value="80" selected>80×60 (low)</option>
+          <option value="120">120×90</option>
+          <option value="160">160×120</option>
+        </select>
+      </label>
+      <label>fps
+        <select id="fps">
+          <option value="15">15</option>
+          <option value="20">20</option>
+          <option value="30" selected>30</option>
+          <option value="60">60</option>
+        </select>
+      </label>
+      <button id="flip">Flip cam</button>
+    </div>
+    <div class="r">
+      <label><input type="checkbox" id="roi" checked> window search</label>
+      <label><input type="checkbox" id="mask"> mask</label>
+      <button id="blind">Screen off</button>
+    </div>
+  </div>
+
+  <button id="start">Tap to start</button>
+</div>
+
+<script>
+const v=document.getElementById('v'), ov=document.getElementById('ov');
+const ctx=ov.getContext('2d');
+const hud=document.getElementById('hud'), big=document.getElementById('big');
+const startBtn=document.getElementById('start'), sampleBtn=document.getElementById('sample');
+const hue=document.getElementById('hue'), tol=document.getElementById('tol'), sat=document.getElementById('sat');
+const hv=document.getElementById('hv'), tv=document.getElementById('tv'), sv=document.getElementById('sv');
+const resSel=document.getElementById('res'), fpsSel=document.getElementById('fps');
+const roiChk=document.getElementById('roi'), maskChk=document.getElementById('mask');
+const flipBtn=document.getElementById('flip'), blindBtn=document.getElementById('blind');
+const sw=document.getElementById('sw');
+
+/* ---- processing buffer. This is the whole trick: we never look at the
+   full camera image. Everything below happens on a tiny thumbnail —
+   80×60 is 4,800 pixels, about 0.5% of a 720p frame. That is roughly
+   what a Pixy2 does internally, and it is why this costs almost nothing. */
+let PW=80, PH=60;
+const proc=document.createElement('canvas');
+const pctx=proc.getContext('2d',{willReadFrequently:true});
+function setRes(w){ PW=+w; PH=Math.round(PW*0.75); proc.width=PW; proc.height=PH; }
+setRes(resSel.value);
+resSel.onchange=()=>setRes(resSel.value);
+
+let hueT=18, hueTol=20, satMin=45;
+const V_MIN=25, MIN_PX=6;
+hue.oninput=()=>{hueT=+hue.value; hv.textContent=hueT;};
+tol.oninput=()=>{hueTol=+tol.value; tv.textContent=hueTol;};
+sat.oninput=()=>{satMin=+sat.value; sv.textContent=satMin;};
+
+let facing='environment', stream=null, wakeLock=null;
+
+/* ---- fast hue test. We avoid a full RGB→HSV conversion per pixel:
+   max/min give us value and saturation directly, and we only compute
+   the hue angle for pixels that are already colourful enough. ---- */
+function hueOf(r,g,b){
+  const mx=Math.max(r,g,b), mn=Math.min(r,g,b), d=mx-mn;
+  if(mx<V_MIN*2.55) return -1;
+  if(d/mx*100 < satMin) return -1;
+  let h;
+  if(mx===r) h=60*(((g-b)/d)%6);
+  else if(mx===g) h=60*((b-r)/d+2);
+  else h=60*((r-g)/d+4);
+  if(h<0) h+=360;
+  return h;
+}
+const hDist=(a,b)=>{const d=Math.abs(a-b)%360; return d>180?360-d:d;};
+
+/* ---- Kalman (constant velocity) — smooths and coasts through dropouts ---- */
+let kx=null, ky=null, kvx=0, kvy=0, miss=0;
+function kPredict(dt){ if(kx===null) return; kx+=kvx*dt; ky+=kvy*dt; miss++; }
+function kUpdate(mx,my,dt){
+  if(kx===null){ kx=mx; ky=my; kvx=0; kvy=0; miss=0; return; }
+  const a=0.55;                       // position blend
+  const nvx=(mx-kx)/Math.max(dt,.001), nvy=(my-ky)/Math.max(dt,.001);
+  kvx=kvx*(1-0.35)+nvx*0.35; kvy=kvy*(1-0.35)+nvy*0.35;
+  kx=kx*(1-a)+mx*a; ky=ky*(1-a)+my*a;
+  miss=0;
+}
+
+/* ---- blob search, optionally limited to a window around the last hit.
+   Window search is the big saver: once locked on, we only examine a
+   small box instead of the whole thumbnail. ---- */
+let lastBlob=null, scanBox=null;
+
+function findBall(){
+  pctx.drawImage(v,0,0,PW,PH);
+  const d=pctx.getImageData(0,0,PW,PH).data;
+
+  let x0=0,y0=0,x1=PW,y1=PH;
+  if(roiChk.checked && lastBlob && miss<6){
+    const pad=Math.max(8, lastBlob.r*3);
+    x0=Math.max(0,(lastBlob.cx-pad)|0); x1=Math.min(PW,(lastBlob.cx+pad)|0);
+    y0=Math.max(0,(lastBlob.cy-pad)|0); y1=Math.min(PH,(lastBlob.cy+pad)|0);
+  }
+  scanBox={x0,y0,x1,y1};
+
+  const w=x1-x0, h=y1-y0;
+  if(w<=0||h<=0){ lastBlob=null; return null; }
+  const mask=new Uint8Array(w*h);
+  let hits=0;
+  for(let y=y0;y<y1;y++){
+    for(let x=x0;x<x1;x++){
+      const i=(y*PW+x)*4;
+      const hh=hueOf(d[i],d[i+1],d[i+2]);
+      if(hh>=0 && hDist(hh,hueT)<=hueTol){ mask[(y-y0)*w+(x-x0)]=1; hits++; }
+    }
+  }
+  if(hits<MIN_PX){
+    if(roiChk.checked && lastBlob){ lastBlob=null; }   // lost: full scan next frame
+    return {blob:null, mask, w, h, x0, y0};
+  }
+
+  // largest connected component
+  const seen=new Uint8Array(w*h); const st=[]; let best=null;
+  for(let s=0;s<mask.length;s++){
+    if(!mask[s]||seen[s]) continue;
+    st.length=0; st.push(s); seen[s]=1;
+    let c=0,sx=0,sy=0,mnX=w,mxX=0,mnY=h,mxY=0;
+    while(st.length){
+      const p=st.pop(), px=p%w, py=(p/w)|0;
+      c++; sx+=px; sy+=py;
+      if(px<mnX)mnX=px; if(px>mxX)mxX=px; if(py<mnY)mnY=py; if(py>mxY)mxY=py;
+      if(px>0   && mask[p-1] && !seen[p-1]){seen[p-1]=1;st.push(p-1);}
+      if(px<w-1 && mask[p+1] && !seen[p+1]){seen[p+1]=1;st.push(p+1);}
+      if(py>0   && mask[p-w] && !seen[p-w]){seen[p-w]=1;st.push(p-w);}
+      if(py<h-1 && mask[p+w] && !seen[p+w]){seen[p+w]=1;st.push(p+w);}
+    }
+    if(c<MIN_PX) continue;
+    const bw=mxX-mnX+1, bh=mxY-mnY+1;
+    const round=(bw/bh)>0.5 && (bw/bh)<2.0 && (c/(bw*bh))>0.42;
+    const cand={c,cx:sx/c+x0,cy:sy/c+y0,r:Math.max(bw,bh)/2,round};
+    if(!best) best=cand;
+    else if(cand.round&&!best.round) best=cand;
+    else if(cand.round===best.round&&cand.c>best.c) best=cand;
+  }
+  lastBlob=best;
+  return {blob:best, mask, w, h, x0, y0};
+}
+
+/* ---- sampling: hold ball in the centre circle ---- */
+let armed=false, cd=0, tmr=null;
+const R_FRAC=0.14;
+const med=a=>{a.sort((p,q)=>p-q); return a[a.length>>1];};
+
+function sampleCentre(){
+  pctx.drawImage(v,0,0,PW,PH);
+  const d=pctx.getImageData(0,0,PW,PH).data;
+  const cx=PW>>1, cy=PH>>1, r=Math.round(Math.min(PW,PH)*R_FRAC);
+  const hs=[], ss=[];
+  for(let y=cy-r;y<cy+r;y++) for(let x=cx-r;x<cx+r;x++){
+    if(x<0||y<0||x>=PW||y>=PH) continue;
+    if((x-cx)**2+(y-cy)**2>r*r) continue;
+    const i=(y*PW+x)*4, R=d[i],G=d[i+1],B=d[i+2];
+    const mx=Math.max(R,G,B), mn=Math.min(R,G,B), dd=mx-mn;
+    if(mx<70||mx>247||dd/mx*100<22) continue;      // skip dark, blown-out, grey
+    let h; if(mx===R)h=60*(((G-B)/dd)%6); else if(mx===G)h=60*((B-R)/dd+2); else h=60*((R-G)/dd+4);
+    if(h<0)h+=360;
+    hs.push(h); ss.push(dd/mx*100);
+  }
+  if(hs.length<15) return false;
+  hueT=Math.round(med(hs)); satMin=Math.max(15,Math.round(med(ss)*0.55));
+  hue.value=hueT; hv.textContent=hueT;
+  sat.value=satMin; sv.textContent=satMin;
+  sw.style.background=`hsl(${hueT} 85% 50%)`;
+  return true;
+}
+sampleBtn.onclick=()=>{
+  if(armed){ clearInterval(tmr); armed=false; sampleBtn.classList.remove('on'); sampleBtn.textContent='Sample ball'; return; }
+  armed=true; cd=3; sampleBtn.classList.add('on');
+  clearInterval(tmr);
+  tmr=setInterval(()=>{
+    if(--cd<=0){
+      clearInterval(tmr);
+      const ok=sampleCentre();
+      sampleBtn.textContent=ok?'Sampled ✓':'No colour';
+      setTimeout(()=>sampleBtn.textContent='Sample ball',1300);
+      armed=false; sampleBtn.classList.remove('on');
+    }
+  },1000);
+};
+
+/* ---- camera ---- */
+async function openCam(){
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  // request a modest capture size: the sensor does less work and so does the GPU
+  stream=await navigator.mediaDevices.getUserMedia({
+    video:{facingMode:facing, width:{ideal:640}, height:{ideal:480}}, audio:false});
+  v.srcObject=stream;
+  await new Promise(r=>{v.onloadedmetadata=r;});
+  await v.play();
+  ov.width=v.videoWidth; ov.height=v.videoHeight;
+  const m = facing==='user';
+  v.classList.toggle('mirror',m); ov.classList.toggle('mirror',m);
+}
+flipBtn.onclick=async()=>{ facing = facing==='user'?'environment':'user'; await openCam(); };
+
+blindBtn.onclick=()=>{
+  document.body.classList.toggle('blind');
+  blindBtn.classList.toggle('on', document.body.classList.contains('blind'));
+  blindBtn.textContent = document.body.classList.contains('blind') ? 'Show video' : 'Screen off';
+};
+
+/* ---- main loop, rate-limited ---- */
+let last=performance.now(), acc=0, fpsShown=0, frames=0, fpsT=0;
+
+function loop(now){
+  requestAnimationFrame(loop);
+  const target=1000/(+fpsSel.value);
+  const dtMs=now-last;
+  if(dtMs<target) return;                 // skip: this is what saves the battery
+  last=now;
+  const dt=Math.min(0.2,dtMs/1000);
+
+  const res=findBall();
+  const blob=res&&res.blob;
+
+  kPredict(dt);
+  if(blob) kUpdate(blob.cx,blob.cy,dt);
+
+  frames++; if(now-fpsT>500){ fpsShown=Math.round(frames*1000/(now-fpsT)); frames=0; fpsT=now; }
+
+  const W=ov.width,H=ov.height, sx=W/PW, sy=H/PH;
+  ctx.clearRect(0,0,W,H);
+
+  if(maskChk.checked&&res&&res.mask){
+    ctx.fillStyle='rgba(226,98,44,.45)';
+    for(let p=0;p<res.mask.length;p++) if(res.mask[p]){
+      const x=(p%res.w)+res.x0, y=((p/res.w)|0)+res.y0;
+      ctx.fillRect(x*sx,y*sy,sx,sy);
+    }
+  }
+  if(roiChk.checked&&scanBox&&scanBox.x1-scanBox.x0<PW){
+    ctx.strokeStyle='rgba(124,255,158,.5)'; ctx.lineWidth=2;
+    ctx.strokeRect(scanBox.x0*sx,scanBox.y0*sy,(scanBox.x1-scanBox.x0)*sx,(scanBox.y1-scanBox.y0)*sy);
+  }
+  if(armed){
+    const r=Math.min(W,H)*R_FRAC;
+    ctx.setLineDash([12,10]); ctx.lineWidth=6; ctx.strokeStyle='#FFD27C';
+    ctx.beginPath(); ctx.arc(W/2,H/2,r,0,6.283); ctx.stroke(); ctx.setLineDash([]);
+  }
+  if(kx!==null&&miss<10){
+    ctx.strokeStyle='#E2622C'; ctx.lineWidth=5;
+    ctx.beginPath(); ctx.arc(kx*sx,ky*sy,Math.max(14,(lastBlob?lastBlob.r:8)*sx),0,6.283); ctx.stroke();
+    ctx.fillStyle='#E2622C';
+    ctx.beginPath(); ctx.arc(kx*sx,ky*sy,5,0,6.283); ctx.fill();
+  }
+
+  // normalised 0-1 coordinates are what you'd actually send onward
+  const nx = kx===null?null:kx/PW, ny = ky===null?null:ky/PH;
+  const seen = blob?'lock':(miss<10&&kx!==null?'coast':'none');
+  hud.textContent =
+    `${fpsShown}fps  ${PW}x${PH}  ${seen}\n` +
+    (nx===null?'x —      y —':
+      `x ${nx.toFixed(3)}  y ${ny.toFixed(3)}\n`+
+      `vx ${Math.round(kvx)} vy ${Math.round(kvy)} px/s`);
+  big.textContent = nx===null?'—':`${nx.toFixed(2)}\n${ny.toFixed(2)}`;
+}
+
+startBtn.onclick=async()=>{
+  startBtn.style.display='none';
+  try{
+    await openCam();
+    sampleBtn.disabled=false;
+    if('wakeLock' in navigator){ try{ wakeLock=await navigator.wakeLock.request('screen'); }catch(e){} }
+    requestAnimationFrame(loop);
+  }catch(e){ hud.textContent='Error: '+e.message; }
+};
+</script>
+</body>
+</html>
