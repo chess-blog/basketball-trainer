@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Body Direction · MoveNet</title>
+<style>
+  :root{--org:#E2622C;--grn:#4FA377;--blu:#9BC7FF;--yel:#FFD27C;--red:#C1443A;--chalk:#F2EDE4;--dim:#8A93A3;}
+  html,body{margin:0;padding:0;background:#0B0E13;overflow:hidden;
+    font-family:-apple-system,sans-serif;color:var(--chalk);}
+  html,body,#wrap{height:100vh;height:100dvh;}
+  #wrap{position:relative;width:100vw;}
+  video,canvas#ov{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+  video{opacity:.5;}
+  video.mir,canvas#ov.mir{transform:scaleX(-1);}
+
+  #meters{position:absolute;top:calc(env(safe-area-inset-top,0px) + 8px);left:8px;z-index:10;
+    background:rgba(0,0,0,.68);padding:9px 10px;border-radius:9px;width:200px;}
+  .m{display:flex;align-items:center;gap:6px;margin-bottom:5px;}
+  .m .lbl{font:700 9px ui-monospace,monospace;width:42px;color:#aab;flex-shrink:0;}
+  .m .trk{position:relative;flex:1;height:13px;background:#20242E;border-radius:4px;overflow:hidden;}
+  .m .mid{position:absolute;left:50%;top:0;bottom:0;width:1px;background:#5a6472;}
+  .m .fil{position:absolute;top:0;bottom:0;border-radius:3px;}
+  .m .gate{position:absolute;top:0;bottom:0;width:2px;background:rgba(255,255,255,.3);}
+  .m .val{font:700 9px ui-monospace,monospace;width:32px;text-align:right;color:#889;flex-shrink:0;}
+  .sec{font:700 8px ui-monospace,monospace;letter-spacing:.14em;color:#667;margin:7px 0 3px;}
+  .sec:first-child{margin-top:0;}
+  .leds{display:flex;gap:6px;margin-top:5px;}
+  .led{flex:1;display:flex;align-items:center;gap:5px;background:#181C24;border-radius:5px;padding:4px 6px;}
+  .led .dot{width:11px;height:11px;border-radius:50%;background:#3a414d;}
+  .led .dot.on{background:#4FA377;box-shadow:0 0 8px #4FA377;}
+  .led .t{font:700 8.5px ui-monospace,monospace;color:#99a;}
+
+  #stats{position:absolute;top:calc(env(safe-area-inset-top,0px) + 8px);right:8px;z-index:10;
+    background:rgba(0,0,0,.68);padding:8px 10px;border-radius:9px;
+    font:11px ui-monospace,monospace;color:#7CFF9E;white-space:pre;text-align:right;}
+  #call{position:absolute;top:44%;left:50%;transform:translate(-50%,-50%);z-index:9;
+    font:800 15vw -apple-system,sans-serif;color:rgba(226,98,44,0);pointer-events:none;}
+  #rule{position:absolute;bottom:calc(env(safe-area-inset-bottom,0px) + 132px);left:0;right:0;
+    text-align:center;z-index:10;font:700 12px -apple-system,sans-serif;
+    letter-spacing:.08em;text-transform:uppercase;color:var(--yel);}
+
+  #panel{position:absolute;left:8px;right:8px;bottom:calc(env(safe-area-inset-bottom,0px) + 14px);
+    z-index:15;background:rgba(0,0,0,.78);padding:10px;border-radius:12px;}
+  .r{display:flex;gap:9px;align-items:center;margin-bottom:8px;}
+  .r:last-child{margin-bottom:0;}
+  label{font-size:10.5px;color:#ccc;display:flex;align-items:center;gap:4px;white-space:nowrap;}
+  input[type=range]{flex:1;min-width:44px;accent-color:var(--org);}
+  button{padding:10px 12px;border:0;border-radius:8px;font-weight:700;font-size:12px;
+    background:#2A3140;color:var(--chalk);}
+  #start{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:20;
+    padding:17px 28px;font-size:18px;background:var(--org);color:#111;border-radius:11px;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" autoplay playsinline muted></video>
+  <canvas id="ov"></canvas>
+
+  <div id="meters">
+    <div class="sec">INTENT</div>
+    <div class="m"><span class="lbl">TILT</span><div class="trk" id="t_tilt"><div class="mid"></div></div><span class="val" id="x_tilt">—</span></div>
+    <div class="m"><span class="lbl">L KNEE</span><div class="trk" id="t_kl"><div class="mid"></div></div><span class="val" id="x_kl">—</span></div>
+    <div class="m"><span class="lbl">R KNEE</span><div class="trk" id="t_kr"><div class="mid"></div></div><span class="val" id="x_kr">—</span></div>
+    <div class="sec">MOTION</div>
+    <div class="m"><span class="lbl">L FOOT</span><div class="trk" id="t_fl"><div class="mid"></div></div><span class="val" id="x_fl">—</span></div>
+    <div class="m"><span class="lbl">R FOOT</span><div class="trk" id="t_fr"><div class="mid"></div></div><span class="val" id="x_fr">—</span></div>
+    <div class="sec">SKELETON</div>
+    <div class="m"><span class="lbl">QUALITY</span><div class="trk" id="t_q"><div class="mid"></div></div><span class="val" id="x_q">—</span></div>
+    <div class="leds">
+      <div class="led"><span class="dot" id="d_l"></span><span class="t">L MOVE</span></div>
+      <div class="led"><span class="dot" id="d_r"></span><span class="t">R MOVE</span></div>
+    </div>
+  </div>
+
+  <div id="stats">—</div>
+  <div id="call"></div>
+  <div id="rule">&nbsp;</div>
+
+  <div id="panel">
+    <div class="r">
+      <label>tilt <span id="tgV">0.30</span></label><input type="range" id="tg" min="5" max="100" value="30">
+      <label>knee° <span id="knV">12</span></label><input type="range" id="kn" min="2" max="40" value="12">
+    </div>
+    <div class="r">
+      <label>L foot <span id="flV">0.45</span></label><input type="range" id="fls" min="5" max="200" value="45">
+      <label>R foot <span id="frV">0.45</span></label><input type="range" id="frs" min="5" max="200" value="45">
+    </div>
+    <div class="r">
+      <label>smooth <span id="smV">0.8</span></label><input type="range" id="sm" min="1" max="40" value="8">
+      <button id="flip">Flip</button>
+      <label><input type="checkbox" id="inv"> invert</label>
+    </div>
+  </div>
+
+  <button id="start">Tap to start camera</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.20.0/dist/tf-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@4.20.0/dist/tf-converter.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.20.0/dist/tf-backend-webgl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const v=$('v'), ov=$('ov'), ctx=ov.getContext('2d');
+const callEl=$('call'), ruleEl=$('rule'), statsEl=$('stats');
+const tgS=$('tg'), knS=$('kn'), flS=$('fls'), frS=$('frs'), smS=$('sm'), inv=$('inv');
+
+tgS.oninput=()=>$('tgV').textContent=(tgS.value/100).toFixed(2);
+knS.oninput=()=>$('knV').textContent=knS.value;
+flS.oninput=()=>$('flV').textContent=(flS.value/100).toFixed(2);
+frS.oninput=()=>$('frV').textContent=(frS.value/100).toFixed(2);
+smS.oninput=()=>$('smV').textContent=(smS.value/10).toFixed(1);
+
+const M={};
+for(const k of ['tilt','kl','kr','fl','fr','q']){
+  const t=$('t_'+k);
+  const f=document.createElement('div'); f.className='fil'; t.appendChild(f);
+  const a=document.createElement('div'); a.className='gate'; a.style.left='25%'; t.appendChild(a);
+  const b=document.createElement('div'); b.className='gate'; b.style.left='75%'; t.appendChild(b);
+  M[k]={f,val:$('x_'+k)};
+}
+function meter(k,val,col){
+  const m=M[k];
+  if(val===null||!isFinite(val)){m.f.style.width='0';m.val.textContent='—';return;}
+  const n=Math.max(-1,Math.min(1,val)), h=Math.abs(n)*50;
+  m.f.style.background=col;
+  m.f.style.left = n>=0?'50%':(50-h)+'%';
+  m.f.style.width = h+'%';
+  m.val.textContent=n.toFixed(2);
+}
+
+/* MoveNet / COCO keypoint order — 17 points, all the ones this logic needs.
+   The heel and toe points MediaPipe had are gone, so a foot is its ankle. */
+const NOSE=0,LSH=5,RSH=6,LEL=7,REL=8,LWR=9,RWR=10,LHIP=11,RHIP=12,LKNE=13,RKNE=14,LANK=15,RANK=16;
+const BONES=[[5,6],[5,7],[7,9],[6,8],[8,10],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
+const NEED=[LSH,RSH,LHIP,RHIP,LKNE,RKNE,LANK,RANK,NOSE];
+const MINSCORE=0.30;
+
+/* ---------- One Euro filter ----------
+   This is the "more reliable" part. MoveNet is faster than MediaPipe but
+   noisier per-frame. A plain average would smooth the jitter and also blunt
+   real movement. One Euro adapts: it filters hard when a point is nearly
+   still (killing jitter) and backs off as the point speeds up (keeping the
+   response). That is exactly the tradeoff this app needs.               */
+class OneEuro{
+  constructor(minCut=0.8, beta=0.02, dCut=1.0){
+    this.minCut=minCut; this.beta=beta; this.dCut=dCut;
+    this.x=null; this.dx=0; this.t=null;
+  }
+  static alpha(cut,dt){ const tau=1/(2*Math.PI*cut); return 1/(1+tau/dt); }
+  filter(x,t,minCut){
+    if(minCut!==undefined) this.minCut=minCut;
+    if(this.x===null){ this.x=x; this.t=t; return x; }
+    const dt=Math.max(0.001,(t-this.t)/1000); this.t=t;
+    const dxRaw=(x-this.x)/dt;
+    const aD=OneEuro.alpha(this.dCut,dt);
+    this.dx = aD*dxRaw + (1-aD)*this.dx;
+    const cut = this.minCut + this.beta*Math.abs(this.dx);
+    const a=OneEuro.alpha(cut,dt);
+    this.x = a*x + (1-a)*this.x;
+    return this.x;
+  }
+}
+const filt = Array.from({length:17},()=>({x:new OneEuro(),y:new OneEuro()}));
+const KP = Array.from({length:17},()=>({x:0,y:0,s:0,ok:false}));
+
+let detector=null, running=false, facing='user', stream=null;
+let detFps=0, detCount=0, detT=0, lastPoseT=0;
+
+async function setup(){
+  statsEl.textContent='loading…';
+  try{ await tf.setBackend('webgl'); }catch(e){}
+  await tf.ready();
+  // Lightning is the speed-first MoveNet variant
+  detector = await poseDetection.createDetector(
+    poseDetection.SupportedModels.MoveNet,
+    {modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING});
+  await cam();
+  running=true;
+  detectLoop();                 // detection runs on its own clock…
+  requestAnimationFrame(render); // …so rendering never waits on it
+}
+async function cam(){
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  // 640x480: pose models downscale internally, so larger frames only cost
+  // decode and upload time for pixels that get thrown away
+  stream=await navigator.mediaDevices.getUserMedia({
+    video:{facingMode:facing,width:{ideal:640},height:{ideal:480}},audio:false});
+  v.srcObject=stream;
+  await new Promise(r=>v.onloadedmetadata=r);
+  await v.play();
+  ov.width=v.videoWidth; ov.height=v.videoHeight;
+  const m=facing==='user';
+  v.classList.toggle('mir',m); ov.classList.toggle('mir',m);
+}
+$('flip').onclick=async()=>{ if(running) { facing=facing==='user'?'environment':'user'; await cam(); } };
+
+async function detectLoop(){
+  while(running){
+    try{
+      const poses = await detector.estimatePoses(v, {maxPoses:1, flipHorizontal:false});
+      const now=performance.now();
+      if(poses && poses[0]){
+        const kp=poses[0].keypoints;
+        const minCut=+smS.value/10;
+        for(let i=0;i<17;i++){
+          const p=kp[i]; if(!p) continue;
+          KP[i].s=p.score??0;
+          KP[i].ok=(p.score??0)>=MINSCORE;
+          if(KP[i].ok){
+            KP[i].x=filt[i].x.filter(p.x,now,minCut);
+            KP[i].y=filt[i].y.filter(p.y,now,minCut);
+          }
+        }
+        lastPoseT=now;
+      }
+      detCount++;
+      if(now-detT>500){ detFps=Math.round(detCount*1000/(now-detT)); detCount=0; detT=now; }
+    }catch(e){ /* skip a bad frame rather than killing the loop */ }
+    await new Promise(r=>setTimeout(r,0));
+  }
+}
+
+/* ---------- feature helpers ---------- */
+const hist=[]; const HIST_MS=400, VEL_MS=120;
+let fLV=0,fRV=0;
+function pushH(t,o){ hist.push({t,...o}); while(hist.length&&t-hist[0].t>HIST_MS) hist.shift(); }
+function vels(now){
+  if(hist.length<2) return null;
+  let r=hist[0]; for(const h of hist){ if(now-h.t<=VEL_MS) break; r=h; }
+  const dt=(now-r.t)/1000; if(dt<0.02) return null;
+  const L=hist[hist.length-1], sc=Math.max(20,L.sc);
+  return {L:(L.fL-r.fL)/sc/dt, R:(L.fR-r.fR)/sc/dt};
+}
+function kneeAngle(hip,knee,ank){
+  const dy=ank.y-hip.y; if(Math.abs(dy)<8) return 0;
+  const lx=hip.x+(ank.x-hip.x)*((knee.y-hip.y)/dy);
+  const seg=Math.hypot(knee.x-hip.x,knee.y-hip.y)||1;
+  return Math.atan2(knee.x-lx,seg)*180/Math.PI;
+}
+
+let hold=0,dir=0,pending=null,stepL=null,stepR=null;
+const st={n:0,hit:0,miss:0,sum:0,last:null};
+
+let rFps=0,rc=0,rt=0;
+
+function render(now){
+  requestAnimationFrame(render);
+  rc++; if(now-rt>500){rFps=Math.round(rc*1000/(now-rt));rc=0;rt=now;}
+
+  const W=ov.width,H=ov.height;
+  ctx.clearRect(0,0,W,H);
+
+  /* ---------- skeleton quality ----------
+     Rather than trusting whatever the model emits, score the skeleton on the
+     points this logic actually depends on, and refuse to call anything when
+     the structure is not there. A confident wrong answer is worse than none. */
+  let sum=0, have=0;
+  for(const i of NEED){ sum+=KP[i].s; if(KP[i].ok) have++; }
+  const quality = have/NEED.length;
+  const fresh = now-lastPoseT < 400;
+  const usable = fresh && quality>=0.75;
+
+  const S=((facing==='user')?-1:1)*(inv.checked?-1:1);
+  const tGate=+tgS.value/100, kGate=+knS.value, gL=+flS.value/100, gR=+frS.value/100;
+  let tilt=null,kL=null,kR=null,motion=0,note='',rule='';
+
+  if(usable){
+    const P=i=>({x:KP[i].x,y:KP[i].y});
+    ctx.strokeStyle='rgba(79,163,119,.75)';ctx.lineWidth=4;ctx.beginPath();
+    for(const [a,b] of BONES){ if(!KP[a].ok||!KP[b].ok) continue;
+      ctx.moveTo(KP[a].x,KP[a].y); ctx.lineTo(KP[b].x,KP[b].y); }
+    ctx.stroke();
+    ctx.fillStyle='#7CFF9E';
+    for(let i=0;i<17;i++) if(KP[i].ok){ ctx.beginPath();ctx.arc(KP[i].x,KP[i].y,4,0,6.283);ctx.fill(); }
+
+    const hip={x:(KP[LHIP].x+KP[RHIP].x)/2, y:(KP[LHIP].y+KP[RHIP].y)/2};
+    const shW=Math.abs(KP[LSH].x-KP[RSH].x)||1;
+
+    // TILT — hips to nose
+    tilt=Math.max(-2,Math.min(2,
+      (Math.atan2(KP[NOSE].x-hip.x, Math.max(hip.y-KP[NOSE].y,1))*180/Math.PI)/25));
+    ctx.strokeStyle='rgba(155,199,255,.4)';ctx.lineWidth=2;ctx.setLineDash([6,9]);
+    ctx.beginPath();ctx.moveTo(hip.x,0);ctx.lineTo(hip.x,H);ctx.stroke();ctx.setLineDash([]);
+    ctx.strokeStyle='#9BC7FF';ctx.lineWidth=6;
+    ctx.beginPath();ctx.moveTo(hip.x,hip.y);ctx.lineTo(KP[NOSE].x,KP[NOSE].y);ctx.stroke();
+
+    // KNEES
+    kL=kneeAngle(P(LHIP),P(LKNE),P(LANK));
+    kR=kneeAngle(P(RHIP),P(RKNE),P(RANK));
+    for(const [k,a] of [[LKNE,kL],[RKNE,kR]]){
+      ctx.fillStyle=Math.abs(a)>kGate?'#FFD27C':'rgba(138,147,163,.7)';
+      ctx.beginPath();ctx.arc(KP[k].x,KP[k].y,Math.abs(a)>kGate?10:6,0,6.283);ctx.fill();
+    }
+
+    // FEET
+    pushH(now,{fL:KP[LANK].x, fR:KP[RANK].x, sc:shW});
+    const vv=vels(now); if(vv){ fLV=vv.L; fRV=vv.R; }
+    const mvL=Math.abs(fLV)>gL, mvR=Math.abs(fRV)>gR;
+    $('d_l').classList.toggle('on',mvL);
+    $('d_r').classList.toggle('on',mvR);
+    if(mvL) stepL={dir:Math.sign(fLV),t:now};
+    if(mvR) stepR={dir:Math.sign(fRV),t:now};
+    if(stepL&&now-stepL.t>900) stepL=null;
+    if(stepR&&now-stepR.t>900) stepR=null;
+
+    const df=(k,mv,vv2)=>{ ctx.fillStyle=mv?'#4FA377':'rgba(138,147,163,.75)';
+      ctx.beginPath();ctx.arc(KP[k].x,KP[k].y,mv?11:7,0,6.283);ctx.fill();
+      if(mv){const d=Math.sign(vv2),ax=KP[k].x+d*shW*0.7;
+        ctx.strokeStyle='#4FA377';ctx.lineWidth=5;
+        ctx.beginPath();ctx.moveTo(KP[k].x,KP[k].y);ctx.lineTo(ax,KP[k].y);ctx.stroke();} };
+    df(LANK,mvL,fLV); df(RANK,mvR,fRV);
+
+    if(stepL&&stepR&&stepL.dir===stepR.dir&&Math.abs(stepL.t-stepR.t)>30){
+      motion=stepL.dir;
+      note=(stepL.t<stepR.t?'L then R':'R then L')+' · '+Math.round(Math.abs(stepL.t-stepR.t))+'ms';
+    }
+
+    // intent: tilt first, knees agreeing as fallback
+    let sig=null;
+    if(Math.abs(tilt)>=tGate){ sig=tilt; rule='tilt'; }
+    else if(Math.abs(kL)>kGate&&Math.abs(kR)>kGate&&Math.sign(kL)===Math.sign(kR)){
+      sig=Math.sign(kL); rule='knees'; }
+    else rule='below gate';
+
+    const raw = sig===null?0:(S*sig>0?1:-1);
+    if(raw!==0&&raw===dir) hold=Math.min(6,hold+1);
+    else if(raw!==0){dir=raw;hold=1;}
+    else hold=Math.max(0,hold-1);
+    if(hold>=3&&(!pending||pending.dir!==dir)) pending={dir,t:now};
+
+    const sM = motion?(S*motion>0?1:-1):0;
+    if(sM&&pending){
+      st.n++;
+      if(sM===pending.dir){st.hit++;st.last=Math.round(now-pending.t);st.sum+=st.last;}
+      else{st.miss++;st.last=null;}
+      pending=null;
+    }
+    if(pending&&now-pending.t>1500) pending=null;
+
+    const cd=hold>=3?dir:0;
+    callEl.textContent=cd?(cd>0?'RIGHT':'LEFT'):'';
+    callEl.style.color=!cd?'rgba(226,98,44,0)':(motion?'rgba(79,163,119,.85)':'rgba(226,98,44,.8)');
+    ruleEl.textContent = motion? ('MOTION '+(sM>0?'RIGHT':'LEFT')+' · '+note) : rule;
+  } else {
+    callEl.textContent=''; $('d_l').classList.remove('on'); $('d_r').classList.remove('on');
+    ruleEl.textContent = !fresh? 'no pose' : 'partial skeleton — step back';
+  }
+
+  meter('tilt', usable?S*tilt:null, '#9BC7FF');
+  meter('kl', usable?S*kL/(kGate*2):null, usable&&Math.abs(kL)>kGate?'#FFD27C':'#5b6472');
+  meter('kr', usable?S*kR/(kGate*2):null, usable&&Math.abs(kR)>kGate?'#FFD27C':'#5b6472');
+  meter('fl', usable?S*fLV/(gL*2):null, Math.abs(fLV)>gL?'#4FA377':'#5b6472');
+  meter('fr', usable?S*fRV/(gR*2):null, Math.abs(fRV)>gR?'#4FA377':'#5b6472');
+  meter('q', quality, quality>=0.75?'#4FA377':'#C1443A');
+
+  const avg=st.hit?Math.round(st.sum/st.hit):null;
+  statsEl.textContent=`${detFps}/s pose\n${rFps}fps draw\nlead ${st.last===null?'—':st.last+'ms'}\navg ${avg===null?'—':avg+'ms'}\n${st.hit}/${st.n}`;
+}
+
+$('start').onclick=()=>{
+  $('start').style.display='none';
+  setup().catch(e=>{statsEl.textContent='Error: '+e.message; console.error(e);});
+};
+</script>
+</body>
+</html>
