@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Proximity Arrow · MoveNet</title>
+<style>
+  :root{--org:#E2622C;--grn:#4FA377;--yel:#FFD27C;--chalk:#F2EDE4;--dim:#8A93A3;}
+  html,body{margin:0;padding:0;background:#0B0E13;overflow:hidden;
+    font-family:-apple-system,sans-serif;color:var(--chalk);}
+  html,body,#wrap{height:100vh;height:100dvh;}
+  #wrap{position:relative;width:100vw;}
+  video,canvas#ov{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+  video{opacity:.28;}
+  video.mir,canvas#ov.mir{transform:scaleX(-1);}
+  canvas#ov{opacity:.7;}
+
+  #arrowBox{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    z-index:8;pointer-events:none;opacity:0;transition:opacity .05s;}
+  #arrowBox.on{opacity:1;}
+  #arrowBox svg{width:78vmin;height:78vmin;}
+  #arrowBox path{fill:var(--chalk);}
+
+  #cd{position:absolute;inset:0;display:none;align-items:center;justify-content:center;z-index:18;
+    font:800 40vmin -apple-system,sans-serif;color:var(--yel);background:rgba(0,0,0,.55);
+    pointer-events:none;}
+  #cd.on{display:flex;}
+
+  #top{position:absolute;top:calc(env(safe-area-inset-top,0px) + 8px);left:8px;right:8px;
+    z-index:10;display:flex;gap:8px;}
+  .card{background:rgba(0,0,0,.72);padding:8px 11px;border-radius:9px;
+    font:11.5px ui-monospace,monospace;white-space:pre;line-height:1.5;}
+  #dist{flex:1;}
+  .bar{position:relative;height:15px;background:#20242E;border-radius:5px;margin-top:6px;overflow:hidden;}
+  .bar .fil{position:absolute;left:0;top:0;bottom:0;background:#4a5262;}
+  .bar .tgt{position:absolute;top:0;bottom:0;width:3px;background:var(--yel);}
+  #reps{color:#7CFF9E;}
+
+  #panel{position:absolute;left:8px;right:8px;bottom:calc(env(safe-area-inset-bottom,0px) + 14px);
+    z-index:15;background:rgba(0,0,0,.78);padding:11px;border-radius:12px;}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:9px;}
+  .row:last-child{margin-bottom:0;}
+  button{border:0;border-radius:9px;font-weight:700;font-family:-apple-system,sans-serif;
+    background:#2A3140;color:var(--chalk);padding:13px 14px;font-size:14px;}
+  #cal{flex:1;background:var(--org);color:#1A0D06;font-size:16px;padding:15px;}
+  #cal.on{background:var(--yel);color:#111;}
+  .dirs{display:flex;gap:6px;flex:1;}
+  .dirs .d{flex:1;text-align:center;padding:10px 0;border-radius:8px;background:#20242E;
+    color:var(--dim);font-size:16px;border:1px solid #333B4A;}
+  .dirs .d.sel{background:#241A14;border-color:var(--org);color:var(--chalk);}
+  label{font-size:11px;color:#ccc;display:flex;align-items:center;gap:5px;white-space:nowrap;}
+  input[type=range]{flex:1;accent-color:var(--org);}
+
+  #start{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:20;
+    padding:17px 28px;font-size:18px;background:var(--org);color:#111;border-radius:11px;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" autoplay playsinline muted></video>
+  <canvas id="ov"></canvas>
+
+  <div id="arrowBox">
+    <svg viewBox="0 0 100 100" id="arrowSvg">
+      <path d="M50 6 L84 46 L63 46 L63 94 L37 94 L37 46 L16 46 Z"/>
+    </svg>
+  </div>
+  <div id="cd"></div>
+
+  <div id="top">
+    <div class="card" id="dist">starting…
+      <div class="bar"><div class="fil" id="fil"></div><div class="tgt" id="tgt" style="display:none"></div></div>
+    </div>
+    <div class="card" id="reps">0</div>
+  </div>
+
+  <div id="panel">
+    <div class="row">
+      <button id="cal">Set distance</button>
+      <button id="flip">Flip</button>
+    </div>
+    <div class="row">
+      <div class="dirs" id="dirs">
+        <div class="d sel" data-d="up">▲</div>
+        <div class="d sel" data-d="right">▶</div>
+        <div class="d sel" data-d="down">▼</div>
+        <div class="d sel" data-d="left">◀</div>
+      </div>
+    </div>
+    <div class="row">
+      <label>arrow <span id="shV">700</span>ms</label>
+      <input type="range" id="sh" min="150" max="2000" step="50" value="700">
+    </div>
+  </div>
+
+  <button id="start">Tap to start camera</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.20.0/dist/tf-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@4.20.0/dist/tf-converter.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.20.0/dist/tf-backend-webgl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const v=$('v'), ov=$('ov'), ctx=ov.getContext('2d');
+const arrowBox=$('arrowBox'), arrowSvg=$('arrowSvg'), cdEl=$('cd');
+const distEl=$('dist'), filEl=$('fil'), tgtEl=$('tgt'), repsEl=$('reps'), shS=$('sh');
+const say=t=>{ distEl.firstChild.textContent=t; };
+shS.oninput=()=>$('shV').textContent=shS.value;
+
+const ROT={up:0,right:90,down:180,left:-90};
+let dirs=['up','right','down','left'];
+$('dirs').onclick=e=>{
+  const d=e.target.closest('.d'); if(!d) return;
+  if(d.classList.contains('sel') && $('dirs').querySelectorAll('.sel').length===1) return;
+  d.classList.toggle('sel');
+  dirs=[...$('dirs').querySelectorAll('.sel')].map(x=>x.dataset.d);
+};
+
+// MoveNet / COCO keypoints
+const NOSE=0, LSH=5, RSH=6, LHIP=11, RHIP=12;
+const BONES=[[5,6],[5,7],[7,9],[6,8],[8,10],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
+const MINSCORE=0.30;
+
+const REARM=0.12, COOLDOWN=600;
+let detector=null, running=false, facing='environment', stream=null;
+let target=null, armed=true, lastFire=0, hideAt=0, reps=0;
+let calPhase=false, calTimer=null;
+let people=[], lastDetT=0, detFps=0, detCount=0, detT=0, detErr=null;
+let sizeSmooth=null;                 // light EMA on the size, to stop trigger chatter
+
+/* distance proxy: no depth sensor, so apparent torso length stands in for
+   distance. Steadier than a bounding box (arms and legs leave frame) and
+   than shoulder width (shortens when someone turns sideways).
+   Normalised by frame height so it does not depend on resolution.       */
+function torsoOf(kp,H){
+  const need=[LSH,RSH,LHIP,RHIP];
+  for(const i of need) if(!kp[i] || (kp[i].score??0)<MINSCORE) return null;
+  const sx=(kp[LSH].x+kp[RSH].x)/2, sy=(kp[LSH].y+kp[RSH].y)/2;
+  const hx=(kp[LHIP].x+kp[RHIP].x)/2, hy=(kp[LHIP].y+kp[RHIP].y)/2;
+  return { size:Math.hypot(sx-hx,sy-hy)/H, sh:{x:sx,y:sy}, hp:{x:hx,y:hy} };
+}
+
+function endCal(capture){
+  clearInterval(calTimer); calTimer=null;
+  calPhase=false; cdEl.classList.remove('on');
+  $('cal').classList.remove('on'); $('cal').textContent='Set distance';
+  if(!capture) return;
+  if(sizeSmooth!==null){ target=sizeSmooth; armed=true; }
+  else say('nobody was in view — try again');
+}
+
+/* countdown runs on its own interval so it can never freeze if detection stalls */
+$('cal').onclick=()=>{
+  if(!running){ say('camera not started yet'); return; }
+  if(calPhase){ endCal(false); return; }
+  calPhase=true;
+  let left=4;
+  cdEl.classList.add('on'); cdEl.textContent=left;
+  $('cal').classList.add('on'); $('cal').textContent='Cancel';
+  clearInterval(calTimer);
+  calTimer=setInterval(()=>{ if(--left>0) cdEl.textContent=left; else endCal(true); },1000);
+};
+
+async function setup(){
+  say('loading MoveNet…');
+  try{ await tf.setBackend('webgl'); }catch(e){}
+  await tf.ready();
+  // MultiPose so "closest person" still works when more than one is in frame
+  detector = await poseDetection.createDetector(
+    poseDetection.SupportedModels.MoveNet,
+    { modelType: poseDetection.movenet.modelType.MULTIPOSE_LIGHTNING,
+      enableTracking: true,
+      trackerType: poseDetection.TrackerType.BoundingBox });
+  say('starting camera…');
+  await cam();
+  if('wakeLock' in navigator){ try{ await navigator.wakeLock.request('screen'); }catch(e){} }
+  running=true;
+  say('stand where you want the trigger, then Set distance');
+  detectLoop();
+  requestAnimationFrame(render);
+}
+async function cam(){
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  stream=await navigator.mediaDevices.getUserMedia({
+    video:{facingMode:facing,width:{ideal:640},height:{ideal:480}},audio:false});
+  v.srcObject=stream;
+  await new Promise(r=>v.onloadedmetadata=r);
+  await v.play();
+  ov.width=v.videoWidth; ov.height=v.videoHeight;
+  const m=facing==='user';
+  v.classList.toggle('mir',m); ov.classList.toggle('mir',m);
+}
+$('flip').onclick=async()=>{ if(running){ facing=facing==='user'?'environment':'user'; await cam(); } };
+
+/* detection runs on its own async loop so rendering never waits on it */
+async function detectLoop(){
+  while(running){
+    try{
+      if(v.readyState>=2){
+        const poses = await detector.estimatePoses(v,{flipHorizontal:false});
+        people = poses||[];
+        lastDetT = performance.now();
+        detErr=null;
+        detCount++;
+        const n=lastDetT;
+        if(n-detT>500){ detFps=Math.round(detCount*1000/(n-detT)); detCount=0; detT=n; }
+      }
+    }catch(e){ detErr=e.message||String(e); }
+    await new Promise(r=>setTimeout(r,0));
+  }
+}
+
+function fire(){
+  const d=dirs[Math.floor(Math.random()*dirs.length)];
+  arrowSvg.style.transform=`rotate(${ROT[d]}deg)`;
+  arrowBox.classList.add('on');
+  hideAt=performance.now()+(+shS.value);
+  reps++; repsEl.textContent=reps;
+}
+
+function render(now){
+  requestAnimationFrame(render);
+  const W=ov.width,H=ov.height;
+  ctx.clearRect(0,0,W,H);
+
+  // pick the closest person = largest torso
+  let best=null;
+  const fresh = now-lastDetT < 500;
+  if(fresh){
+    for(const p of people){
+      const t=torsoOf(p.keypoints,H);
+      if(t && (!best||t.size>best.size)) best={...t, kp:p.keypoints};
+    }
+  }
+
+  // light smoothing so a jittery frame cannot fire the arrow on its own
+  if(best) sizeSmooth = sizeSmooth===null? best.size : sizeSmooth*0.6 + best.size*0.4;
+  else sizeSmooth = null;
+
+  if(best){
+    ctx.strokeStyle='rgba(79,163,119,.45)'; ctx.lineWidth=3; ctx.beginPath();
+    for(const [a,b] of BONES){
+      const A=best.kp[a],B=best.kp[b];
+      if(!A||!B||(A.score??0)<MINSCORE||(B.score??0)<MINSCORE) continue;
+      ctx.moveTo(A.x,A.y); ctx.lineTo(B.x,B.y);
+    }
+    ctx.stroke();
+    ctx.strokeStyle=armed?'rgba(79,163,119,.95)':'rgba(226,98,44,.95)';
+    ctx.lineWidth=8;
+    ctx.beginPath(); ctx.moveTo(best.sh.x,best.sh.y); ctx.lineTo(best.hp.x,best.hp.y); ctx.stroke();
+    ctx.fillStyle=ctx.strokeStyle;
+    ctx.beginPath(); ctx.arc(best.sh.x,best.sh.y,10,0,6.283); ctx.fill();
+    ctx.beginPath(); ctx.arc(best.hp.x,best.hp.y,10,0,6.283); ctx.fill();
+  }
+
+  // ---- trigger ----
+  if(target && sizeSmooth!==null && !calPhase){
+    if(armed && sizeSmooth>=target && now-lastFire>COOLDOWN){ fire(); lastFire=now; armed=false; }
+    if(!armed && sizeSmooth < target*(1-REARM)) armed=true;
+  }
+  if(sizeSmooth===null && !armed) armed=true;     // walked out; next entry counts
+
+  if(now>hideAt) arrowBox.classList.remove('on');
+
+  // ---- readout ----
+  if(!calPhase){
+    if(detErr) say('detect error: '+detErr.slice(0,50));
+    else if(sizeSmooth===null) say(target?'no one in view — waiting':'no one in view');
+    else if(!target) say(`torso ${sizeSmooth.toFixed(3)}\npress SET DISTANCE`);
+    else say(`${sizeSmooth.toFixed(3)} / ${target.toFixed(3)}  ${detFps}/s\n`+
+             (armed ? (sizeSmooth>=target?'TRIGGER':'come closer') : 'in zone — step back'));
+  }
+
+  const scale=Math.max(target?target*1.8:0.4, sizeSmooth?sizeSmooth*1.1:0.001);
+  filEl.style.width=((sizeSmooth||0)/scale*100)+'%';
+  filEl.style.background=(target&&sizeSmooth&&sizeSmooth>=target)?'#4FA377':'#4a5262';
+  if(target){ tgtEl.style.display='block'; tgtEl.style.left=(target/scale*100)+'%'; }
+}
+
+$('start').onclick=()=>{
+  $('start').style.display='none';
+  setup().catch(e=>{ say('Error: '+e.message); console.error(e); });
+};
+</script>
+</body>
+</html>
