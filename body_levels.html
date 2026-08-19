@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Body Levels</title>
+<style>
+  :root{--org:#E2622C;--blu:#6FA8DC;--yel:#FFD27C;--grn:#4FA377;--dim:#8A93A3;}
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;
+    font-family:-apple-system,sans-serif;color:#F2EDE4;-webkit-text-size-adjust:none;}
+  html,body,#wrap{height:100vh;height:100dvh;}
+  #wrap{position:relative;width:100vw;}
+  video,canvas#ov{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+  video{opacity:.45;}
+  video.mir,canvas#ov.mir{transform:scaleX(-1);}
+
+  /* distance readout — one tenth of the screen height */
+  #dist{position:absolute;left:0;right:0;top:calc(env(safe-area-inset-top,0px) + 2vh);
+    text-align:center;z-index:12;pointer-events:none;}
+  #dNum{font:800 10vh ui-monospace,monospace;line-height:1;color:#fff;
+    font-variant-numeric:tabular-nums;text-shadow:0 2px 14px #000;}
+  #dNum.cal{color:var(--dim);}
+  #dUnit{font:700 2.4vh ui-monospace,monospace;letter-spacing:.2em;color:var(--dim);}
+
+  #hud{position:absolute;left:8px;bottom:calc(env(safe-area-inset-bottom,0px) + 104px);
+    z-index:12;background:rgba(0,0,0,.6);padding:7px 10px;border-radius:8px;
+    font:11px ui-monospace,monospace;white-space:pre;line-height:1.5;color:#7CFF9E;}
+
+  #panel{position:absolute;left:8px;right:8px;bottom:calc(env(safe-area-inset-bottom,0px) + 10px);
+    z-index:15;background:rgba(0,0,0,.86);padding:10px;border-radius:12px;border:1px solid #262b34;}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:7px;}
+  .row:last-child{margin-bottom:0;}
+  label{font-size:11px;color:#ccc;display:flex;align-items:center;gap:5px;white-space:nowrap;}
+  input[type=number]{width:64px;background:#111;color:#fff;border:1px solid #444;
+    border-radius:7px;padding:8px;font:13px ui-monospace,monospace;}
+  button{border:0;border-radius:8px;font-weight:700;font-family:-apple-system,sans-serif;
+    background:#2A3140;color:#F2EDE4;padding:11px 13px;font-size:13px;}
+  #cal{flex:1;background:var(--org);color:#1A0D06;font-size:14px;padding:13px;}
+  #cal.on{background:var(--yel);color:#111;}
+  #show{position:absolute;right:8px;bottom:calc(env(safe-area-inset-bottom,0px) + 10px);
+    z-index:16;display:none;}
+  body.clean #panel{display:none;} body.clean #show{display:block;}
+
+  #start{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:20;
+    padding:17px 28px;font-size:18px;background:var(--org);color:#111;border-radius:11px;}
+  #cd{position:absolute;inset:0;display:none;align-items:center;justify-content:center;z-index:18;
+    font:800 32vmin -apple-system,sans-serif;color:var(--yel);background:rgba(0,0,0,.5);pointer-events:none;}
+  #cd.on{display:flex;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" autoplay playsinline muted></video>
+  <canvas id="ov"></canvas>
+
+  <div id="dist"><div id="dNum">--</div><div id="dUnit">METRES</div></div>
+  <div id="hud">tap to start</div>
+  <div id="cd"></div>
+</div>
+
+<button id="show">controls</button>
+
+<div id="panel">
+  <div class="row">
+    <button id="cal">Calibrate</button>
+    <label>at <input type="number" id="ref" value="2.0" step="0.1" min="0.3"> m</label>
+    <button id="flip">Flip</button>
+    <button id="hide">Hide</button>
+  </div>
+</div>
+
+<button id="start">Tap to start camera</button>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const $=id=>document.getElementById(id);
+const v=$('v'), ov=$('ov'), ctx=ov.getContext('2d');
+const hud=$('hud'), dNum=$('dNum'), cdEl=$('cd');
+
+const NOSE=0,LSH=11,RSH=12,LWR=15,RWR=16,LHIP=23,RHIP=24,LANK=27,RANK=28;
+const MINVIS=0.4;
+
+let pose=null, facing='user', stream=null, running=false;
+let KP=null, err=null, fps=0, fc=0, ft=0;
+let refTorso=null, refDist=2.0;          // calibration pair
+
+async function setup(){
+  hud.textContent='loading pose model…';
+  const fr=await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  pose=await PoseLandmarker.createFromOptions(fr,{
+    baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+      delegate:"GPU"},
+    runningMode:"VIDEO", numPoses:1});
+  await cam();
+  if('wakeLock' in navigator){ try{ await navigator.wakeLock.request('screen'); }catch(e){} }
+  running=true;
+  requestAnimationFrame(loop);
+}
+async function cam(){
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  stream=await navigator.mediaDevices.getUserMedia({
+    video:{facingMode:facing,width:{ideal:1280},height:{ideal:720}},audio:false});
+  v.srcObject=stream;
+  await new Promise(r=>v.onloadedmetadata=r);
+  await v.play();
+  ov.width=v.videoWidth; ov.height=v.videoHeight;
+  const m=facing==='user';
+  v.classList.toggle('mir',m); ov.classList.toggle('mir',m);
+}
+$('flip').onclick=async()=>{ if(running){ facing=facing==='user'?'environment':'user'; await cam(); } };
+$('hide').onclick=()=>document.body.classList.add('clean');
+$('show').onclick=()=>document.body.classList.remove('clean');
+
+/* calibration: hold still at a known distance, capture the torso length.
+   Everything after is that reference scaled — torso length falls off as
+   1/distance, so distance = ref_distance x (ref_torso / current_torso). */
+let calTimer=null, calPhase=false, lastTorso=null;
+$('cal').onclick=()=>{
+  if(!running) return;
+  if(calPhase){ endCal(false); return; }
+  calPhase=true; let left=3;
+  cdEl.classList.add('on'); cdEl.textContent=left;
+  $('cal').classList.add('on'); $('cal').textContent='Cancel';
+  clearInterval(calTimer);
+  calTimer=setInterval(()=>{ if(--left>0) cdEl.textContent=left; else endCal(true); },1000);
+};
+function endCal(capture){
+  clearInterval(calTimer); calPhase=false;
+  cdEl.classList.remove('on');
+  $('cal').classList.remove('on'); $('cal').textContent='Calibrate';
+  if(capture && lastTorso){ refTorso=lastTorso; refDist=Math.max(0.3, parseFloat($('ref').value)||2); }
+}
+
+const ok=i=>KP && KP[i] && (KP[i].visibility===undefined || KP[i].visibility>=MINVIS);
+
+function loop(now){
+  requestAnimationFrame(loop);
+  fc++; if(now-ft>500){ fps=Math.round(fc*1000/(now-ft)); fc=0; ft=now; }
+
+  try{
+    const r=pose.detectForVideo(v, now);
+    KP=(r.landmarks&&r.landmarks.length)?r.landmarks[0]:null;
+    err=null;
+  }catch(e){ err=e.message; }
+
+  const W=ov.width,H=ov.height;
+  ctx.clearRect(0,0,W,H);
+
+  const need=[LSH,RSH,LWR,RWR,LHIP,RHIP,LANK,RANK];
+  if(!KP || !need.every(ok)){
+    dNum.textContent='--'; lastTorso=null;
+    hud.textContent = err? ('err: '+err.slice(0,36)) : (KP?'need full body in frame':'no body');
+    return;
+  }
+
+  const P=i=>({x:KP[i].x*W, y:KP[i].y*H});
+  const hands=[P(LWR),P(RWR)], hips=[P(LHIP),P(RHIP)], feet=[P(LANK),P(RANK)];
+  const sh={x:(P(LSH).x+P(RSH).x)/2, y:(P(LSH).y+P(RSH).y)/2};
+  const hipMid={x:(hips[0].x+hips[1].x)/2, y:(hips[0].y+hips[1].y)/2};
+
+  /* Three level lines. Each is drawn at the mean height of its pair and
+     centred on that pair's midpoint, but they all take the length of the
+     widest of the three so the three bars are directly comparable. */
+  const spans=[hands,hips,feet].map(p=>Math.abs(p[0].x-p[1].x));
+  const L=Math.max(...spans, 40);
+
+  function level(pair, col, label){
+    const y=(pair[0].y+pair[1].y)/2;
+    const cx=(pair[0].x+pair[1].x)/2;
+    ctx.strokeStyle=col; ctx.lineWidth=7; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(cx-L/2,y); ctx.lineTo(cx+L/2,y); ctx.stroke();
+    ctx.fillStyle=col;
+    for(const p of pair){ ctx.beginPath(); ctx.arc(p.x,p.y,11,0,6.283); ctx.fill(); }
+    ctx.save(); ctx.scale(-1,1);
+    ctx.font='700 22px ui-monospace,monospace'; ctx.textAlign='left';
+    ctx.fillText(label, -(cx+L/2)+8, y-14);
+    ctx.restore();
+  }
+  level(hands,'#E2622C','HANDS');
+  level(hips ,'#6FA8DC','HIPS');
+  level(feet ,'#FFD27C','FEET');
+
+  /* Torso keeps its own length — that length is the distance gauge. */
+  const torsoPx=Math.hypot(sh.x-hipMid.x, sh.y-hipMid.y);
+  lastTorso=torsoPx/H;                       // resolution-independent
+  ctx.strokeStyle='#4FA377'; ctx.lineWidth=9; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(hipMid.x,hipMid.y); ctx.lineTo(sh.x,sh.y); ctx.stroke();
+  ctx.setLineDash([7,9]); ctx.lineWidth=3; ctx.strokeStyle='rgba(79,163,119,.5)';
+  ctx.beginPath(); ctx.moveTo(hipMid.x,hipMid.y); ctx.lineTo(hipMid.x,sh.y); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle='#4FA377';
+  ctx.beginPath(); ctx.arc(sh.x,sh.y,12,0,6.283); ctx.fill();
+
+  const tiltDeg=Math.atan2(sh.x-hipMid.x, Math.max(hipMid.y-sh.y,1))*180/Math.PI;
+
+  if(refTorso){
+    const d=refDist*(refTorso/lastTorso);
+    dNum.textContent=d.toFixed(2); dNum.classList.remove('cal');
+  } else {
+    dNum.textContent='--'; dNum.classList.add('cal');
+  }
+
+  const sTilt = (facing==='user'? -1:1)*tiltDeg;
+  hud.textContent =
+    `${fps}fps\n`+
+    `torso ${lastTorso.toFixed(3)}  tilt ${sTilt>=0?'+':''}${sTilt.toFixed(1)}\u00B0\n`+
+    (refTorso? `ref ${refTorso.toFixed(3)} @ ${refDist}m` : 'press CALIBRATE');
+}
+
+$('start').onclick=()=>{ $('start').style.display='none';
+  setup().catch(e=>{hud.textContent='FAILED: '+(e.message||e); console.error(e);}); };
+</script>
+</body>
+</html>
